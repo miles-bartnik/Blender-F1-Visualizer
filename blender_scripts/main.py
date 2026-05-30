@@ -2555,16 +2555,15 @@ def main():
             except Exception as e:
                 print(f"  [{blender_name} - water]  SKIP - {e}")
 
-        # ── Step 3: Project water bodies onto terrain (flat surface) ───
-        # Sea → Z=0 (sea level). Inland bodies → mean terrain height.
-        # Must happen before depth functions are computed so depth_fns
-        # are built from the correctly-positioned mesh vertices.
-        for w_obj, is_sea, _ring, _depth in all_water_data:
+        # ── Step 3: Project water bodies onto terrain ──────────────────
+        # Use terrain_z_fn per vertex for ALL water bodies (sea and inland).
+        # terrain_z_fn clamps to max(DEM, 0.0), so open-sea vertices land at
+        # Z=0 naturally. Boundary hexagons that straddle the coastline get the
+        # correct terrain elevation on their land-side vertices rather than
+        # defaulting to 0, which would create a sawtooth at the water edge.
+        for w_obj, _is_sea, _ring, _depth in all_water_data:
             try:
-                project_water_mesh_to_terrain(
-                    w_obj,
-                    terrain_z_fn if not is_sea else None,
-                    target_z=0.0 if is_sea else None)
+                project_water_mesh_to_terrain(w_obj, terrain_z_fn)
             except Exception as e:
                 print(f"  [{w_obj.name}]  projection SKIP - {e}")
 
