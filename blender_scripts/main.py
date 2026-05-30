@@ -1026,68 +1026,6 @@ def build_water_curve(feat, lon_origin, lat_origin, parent_obj, blender_name,
     return mesh_obj
 
 
-def remove_terrain_faces_under_water(terrain_obj, water_rings, lon_origin, lat_origin):
-    """
-    Delete terrain mesh faces whose centroid falls inside any water polygon.
-
-    The water body mesh (sea / lake) covers those faces visually, so keeping
-    them in the terrain mesh only creates Z=0 vertices at the water edge that
-    produce a sawtooth where coastal H3 cells straddle the coastline.
-
-    Uses Shapely prepared geometry for fast per-face containment tests.
-    """
-    if terrain_obj is None or not water_rings or not HAVE_SHAPELY:
-        return
-    import bmesh as _bm
-    from shapely.geometry import Polygon as _Poly, Point as _Pt
-    from shapely.prepared import prep as _prep
-    from shapely.ops import unary_union
-
-    cos_lat = _cos_lat_cache.get(lat_origin) or math.cos(math.radians(lat_origin))
-
-    polys = []
-    for ring in water_rings:
-        if ring and len(ring) >= 3:
-            try:
-                p = _Poly([(pt[0], pt[1]) for pt in ring])
-                if not p.is_valid:
-                    p = p.buffer(0)
-                polys.append(p)
-            except Exception:
-                pass
-    if not polys:
-        return
-
-    water_union = unary_union(polys)
-    water_prep  = _prep(water_union)
-
-    me = terrain_obj.data
-    bm = _bm.new()
-    bm.from_mesh(me)
-    bm.faces.ensure_lookup_table()
-
-    to_delete = []
-    for face in bm.faces:
-        n   = len(face.verts)
-        cx  = sum(v.co.x for v in face.verts) / n
-        cy  = sum(v.co.y for v in face.verts) / n
-        lon = cx / (cos_lat * SCALE) + lon_origin
-        lat = cy / SCALE + lat_origin
-        if water_prep.contains(_Pt(lon, lat)):
-            to_delete.append(face)
-
-    if to_delete:
-        _bm.ops.delete(bm, geom=to_delete, context='FACES_ONLY')
-        orphans = [v for v in bm.verts if not v.link_faces]
-        if orphans:
-            _bm.ops.delete(bm, geom=orphans, context='VERTS')
-
-    bm.to_mesh(me)
-    bm.free()
-    me.update()
-    print(f"  [{terrain_obj.name}]  removed {len(to_delete)} water-covered terrain faces")
-
-
 def apply_water_depth_to_terrain(terrain_obj, depth_fns, blender_name):
     """
     Depress terrain vertices by the combined depth offset from all water bodies.
@@ -2649,18 +2587,6 @@ def main():
                     depth_fns.append(depth_fn)
             except Exception as e:
                 print(f"  [{w_obj.name}]  depth_fn SKIP - {e}")
-
-        # ── Step 4b: Remove terrain faces covered by water ─────────────
-        # Terrain H3 cells that straddle the coastline have vertices on both
-        # the land side (positive Z) and sea side (Z=0, clamped DEM) — this
-        # creates a sawtooth in the terrain mesh at the water edge. Remove
-        # those faces; the water body mesh covers that area visually.
-        try:
-            water_rings = [ring for _, _, ring, _ in all_water_data]
-            remove_terrain_faces_under_water(
-                terrain_obj, water_rings, lon_origin, lat_origin)
-        except Exception as e:
-            print(f"  [{blender_name}]  terrain water-face removal SKIP - {e}")
 
         boundary_feats = features_by_type.get("terrain_boundary", [])
         if boundary_feats:
