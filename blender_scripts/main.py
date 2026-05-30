@@ -399,15 +399,14 @@ def _make_water_depth_offset_fn(mesh_obj, ring, depth_m, lon_origin, lat_origin)
     return depth_fn
 
 
-def project_water_mesh_flat(water_obj, terrain_z_fn, target_z=None):
+def project_water_mesh_to_terrain(water_obj, terrain_z_fn, target_z=None):
     """
-    Flatten all vertices of a water body mesh to a single Z elevation.
+    Project each water body mesh vertex to the terrain surface Z.
 
-    If target_z is given, use it directly (e.g., 0.0 for sea).
-    Otherwise compute mean terrain height across all mesh vertex (x,y)
-    positions using terrain_z_fn (one representative Z per water body).
-
-    A real water surface is always a horizontal plane - never terrain-following.
+    If target_z is given, all vertices are set to that fixed value (e.g. 0.0
+    for sea, which sits at sea level regardless of terrain).
+    Otherwise each vertex gets its own Z from terrain_z_fn(x, y) — the same
+    per-point lookup used by project_spline_to_terrain for circuits and roads.
     """
     if water_obj is None:
         return
@@ -415,22 +414,23 @@ def project_water_mesh_flat(water_obj, terrain_z_fn, target_z=None):
     if not mesh.vertices:
         return
 
-    if target_z is None:
-        if terrain_z_fn is None:
-            target_z = 0.0
-        elif HAVE_NUMPY:
-            import numpy as _np
-            xy    = _np.array([(v.co.x, v.co.y) for v in mesh.vertices])
-            batch = getattr(terrain_z_fn, 'batch', None)
-            zs    = batch(xy[:, 0], xy[:, 1]) if batch is not None else \
-                    _np.array([terrain_z_fn(x, y) for x, y in xy])
-            target_z = float(_np.mean(zs))
-        else:
-            zs = [terrain_z_fn(v.co.x, v.co.y) for v in mesh.vertices]
-            target_z = sum(zs) / len(zs)
+    if target_z is not None:
+        for v in mesh.vertices:
+            v.co.z = target_z
+    elif terrain_z_fn is None:
+        return
+    elif HAVE_NUMPY:
+        import numpy as _np
+        xy    = _np.array([(v.co.x, v.co.y) for v in mesh.vertices])
+        batch = getattr(terrain_z_fn, 'batch', None)
+        zs    = batch(xy[:, 0], xy[:, 1]) if batch is not None else \
+                _np.array([terrain_z_fn(x, y) for x, y in xy])
+        for v, z in zip(mesh.vertices, zs.tolist()):
+            v.co.z = z
+    else:
+        for v in mesh.vertices:
+            v.co.z = terrain_z_fn(v.co.x, v.co.y)
 
-    for v in mesh.vertices:
-        v.co.z = target_z
     mesh.update()
 
 
@@ -967,13 +967,10 @@ def build_sea_curve(feat, lon_origin, lat_origin, parent_obj, blender_name,
 
     # Build depth fn from actual surviving mesh vertices so deleted
     # islands cannot cause phantom terrain depressions.
-    depth_fn = _make_water_depth_offset_fn(
-        mesh_obj, ring or [], depth_m, lon_origin, lat_origin)
-
     attach_nodegroup(mesh_obj, "Sea")
     print(f"  [{mesh_name}]  {len(triangles)} tris  "
           f"{len(mesh_obj.data.vertices)} verts (merged)  depth={depth_m:.1f}m")
-    return mesh_obj, depth_fn
+    return mesh_obj
 
 
 def build_water_curve(feat, lon_origin, lat_origin, parent_obj, blender_name,
@@ -982,15 +979,15 @@ def build_water_curve(feat, lon_origin, lat_origin, parent_obj, blender_name,
     """
     Build a water body hex mesh at Z=0 (flat). Z is projected to mean terrain
     height by project_water_mesh_flat after this returns. Depth displacement is
-    handled separately by apply_water_depth_to_terrain.
-    Returns (mesh_obj, depth_offset_fn) — either may be None on failure.
+    computed from the projected mesh and applied by apply_water_depth_to_terrain.
+    Returns mesh_obj or None on failure.
     """
     props     = feat.get("properties", {})
     water_tag = props.get("water_tag", "water")
 
     triangles = props.get("triangles", [])
     if not triangles or len(triangles) // 6 < MIN_WATER_HEX:
-        return None, None
+        return None
 
     tag_counts[water_tag] = tag_counts.get(water_tag, 0) + 1
     obj_name  = f"{blender_name} - Water - {water_tag} - {tag_counts[water_tag]}"
@@ -1007,15 +1004,12 @@ def build_water_curve(feat, lon_origin, lat_origin, parent_obj, blender_name,
 
     if mesh_obj is None:
         print(f"  [{mesh_name}]  mesh build failed or empty after island filter - skipped")
-        return None, None
-
-    depth_fn = _make_water_depth_offset_fn(
-        mesh_obj, ring or [], depth_m, lon_origin, lat_origin)
+        return None
 
     attach_nodegroup(mesh_obj, "Water")
     print(f"  [{mesh_name}]  {len(triangles)} tris  "
           f"{len(mesh_obj.data.vertices)} verts (merged)  depth={depth_m:.1f}m")
-    return mesh_obj, depth_fn
+    return mesh_obj
 
 
 def apply_water_depth_to_terrain(terrain_obj, depth_fns, blender_name):
@@ -2512,53 +2506,64 @@ def main():
                   f"cap={depth_cap}m  -> {depth_m:.1f}m")
             return depth_m
 
-        # ── Sea polygons ───────────────────────────────────────────────
-        all_water_objs = []    # (mesh_obj, is_sea) tuples for projection step
-        depth_fns      = []
+        # ── Step 2: Build water body meshes (flat at Z=0) ─────────────
+        # Each entry: (mesh_obj, is_sea, ring, depth_m)
+        # ring and depth_m are preserved so depth_fn can be computed
+        # from the projected mesh in step 4, not from the flat mesh here.
+        all_water_data = []
+        water_tag_counts = {}
+
         for feat in features_by_type.get("sea", []):
             try:
                 ring    = ((feat.get("geometry") or {}).get("coordinates") or [[]])[0]
                 depth_m = _depth_for_ring(ring, "sea")
-                w_obj, depth_fn = build_sea_curve(feat, lon_origin, lat_origin,
-                                                   parent_empty, blender_name,
-                                                   depth_m=depth_m, ring=ring,
-                                                   collection=water_col)
+                w_obj   = build_sea_curve(feat, lon_origin, lat_origin,
+                                          parent_empty, blender_name,
+                                          depth_m=depth_m, ring=ring,
+                                          collection=water_col)
                 if w_obj is not None:
-                    all_water_objs.append((w_obj, True))
-                if depth_fn is not None:
-                    depth_fns.append(depth_fn)
+                    all_water_data.append((w_obj, True, ring, depth_m))
             except Exception as e:
                 print(f"  [{blender_name} - Sea]  SKIP - {e}")
 
-        # ── Water bodies ───────────────────────────────────────────────
-        water_tag_counts = {}
         for feat in features_by_type.get("water_body", []):
             try:
                 water_tag = (feat.get("properties") or {}).get("water_tag", "water")
                 ring      = ((feat.get("geometry") or {}).get("coordinates") or [[]])[0]
                 depth_m   = _depth_for_ring(ring, water_tag)
-                w_obj, depth_fn = build_water_curve(feat, lon_origin, lat_origin,
-                                                      parent_empty, blender_name,
-                                                      water_tag_counts,
-                                                      depth_m=depth_m, ring=ring,
-                                                      collection=water_col)
+                w_obj     = build_water_curve(feat, lon_origin, lat_origin,
+                                              parent_empty, blender_name,
+                                              water_tag_counts,
+                                              depth_m=depth_m, ring=ring,
+                                              collection=water_col)
                 if w_obj is not None:
-                    all_water_objs.append((w_obj, False))
-                if depth_fn is not None:
-                    depth_fns.append(depth_fn)
+                    all_water_data.append((w_obj, False, ring, depth_m))
             except Exception as e:
                 print(f"  [{blender_name} - water]  SKIP - {e}")
 
         # ── Step 3: Project water bodies onto terrain (flat surface) ───
         # Sea → Z=0 (sea level). Inland bodies → mean terrain height.
-        for w_obj, is_sea in all_water_objs:
+        # Must happen before depth functions are computed so depth_fns
+        # are built from the correctly-positioned mesh vertices.
+        for w_obj, is_sea, _ring, _depth in all_water_data:
             try:
-                project_water_mesh_flat(
+                project_water_mesh_to_terrain(
                     w_obj,
                     terrain_z_fn if not is_sea else None,
                     target_z=0.0 if is_sea else None)
             except Exception as e:
                 print(f"  [{w_obj.name}]  projection SKIP - {e}")
+
+        # ── Step 4a: Build depth functions from projected meshes ────────
+        depth_fns = []
+        for w_obj, _is_sea, ring, depth_m in all_water_data:
+            try:
+                depth_fn = _make_water_depth_offset_fn(
+                    w_obj, ring, depth_m, lon_origin, lat_origin)
+                if depth_fn is not None:
+                    depth_fns.append(depth_fn)
+            except Exception as e:
+                print(f"  [{w_obj.name}]  depth_fn SKIP - {e}")
 
         boundary_feats = features_by_type.get("terrain_boundary", [])
         if boundary_feats:
