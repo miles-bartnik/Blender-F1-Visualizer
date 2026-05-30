@@ -276,7 +276,8 @@ def water_edge_falloff(t):
     return 0.5 * (1.0 - math.cos(math.pi * tt))
 
 
-def _make_water_depth_offset_fn(mesh_obj, ring, depth_m, lon_origin, lat_origin):
+def _make_water_depth_offset_fn(mesh_obj, ring, depth_m, lon_origin, lat_origin,
+                                bbox=None):
     """
     Build a depth-offset function from the actual, post-island-filtered mesh vertices.
 
@@ -284,6 +285,11 @@ def _make_water_depth_offset_fn(mesh_obj, ring, depth_m, lon_origin, lat_origin)
       - Stray mesh fragments that were deleted by island filtering are also
         excluded from terrain displacement.
       - Every source position is a vertex that exists in the visible mesh.
+
+    bbox : optional (lon_min, lat_min, lon_max, lat_max). When provided, bbox
+        edges are excluded from the falloff boundary so that water bodies
+        clipped against the terrain boundary do not get a reduced depth near
+        the bbox edge. Only the natural shoreline drives the falloff.
 
     The returned function takes Blender (x, y) and returns the depression
     in Blender Z-units for that point.  It returns 0 for any point that
@@ -299,7 +305,15 @@ def _make_water_depth_offset_fn(mesh_obj, ring, depth_m, lon_origin, lat_origin)
         poly = ShapelyPolygon([(p[0], p[1]) for p in ring])
         if not poly.is_valid:
             poly = poly.buffer(0)
-        boundary = poly.boundary
+        full_boundary = poly.boundary
+
+        if bbox is not None:
+            from shapely.geometry import box as _box
+            bbox_boundary = _box(bbox[0], bbox[1], bbox[2], bbox[3]).boundary
+            natural_boundary = full_boundary.difference(bbox_boundary)
+            boundary = natural_boundary if not natural_boundary.is_empty else full_boundary
+        else:
+            boundary = full_boundary
     except Exception:
         return None
 
@@ -2555,11 +2569,21 @@ def main():
                 print(f"  [{w_obj.name}]  projection SKIP - {e}")
 
         # ── Step 4a: Build depth functions from projected meshes ────────
+        # Pass bbox so that bbox edges are excluded from the falloff boundary —
+        # only natural shoreline/coastline segments drive the edge taper.
+        _tp   = terrain_props or {}
+        _bbox = (
+            _tp.get("lon_min"), _tp.get("lat_min"),
+            _tp.get("lon_max"), _tp.get("lat_max"),
+        ) if all(_tp.get(k) is not None for k in
+                 ("lon_min", "lat_min", "lon_max", "lat_max")) else None
+
         depth_fns = []
         for w_obj, _is_sea, ring, depth_m in all_water_data:
             try:
                 depth_fn = _make_water_depth_offset_fn(
-                    w_obj, ring, depth_m, lon_origin, lat_origin)
+                    w_obj, ring, depth_m, lon_origin, lat_origin,
+                    bbox=_bbox)
                 if depth_fn is not None:
                     depth_fns.append(depth_fn)
             except Exception as e:
