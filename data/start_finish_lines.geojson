@@ -1,0 +1,590 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "au-1953",
+        "name": "Australia — Albert Park"
+      },
+      "geometry": {
+        "coordinates": [
+          144.9697047,
+          -37.8506353
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "cn-2004",
+        "name": "China — Shanghai"
+      },
+      "geometry": {
+        "coordinates": [
+          121.2183800,
+          31.3368350
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "jp-1962",
+        "name": "Japan — Suzuka"
+      },
+      "geometry": {
+        "coordinates": [
+          136.5402830,
+          34.8433440
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "bh-2002",
+        "name": "Bahrain — Sakhir"
+      },
+      "geometry": {
+        "coordinates": [
+          50.5105390,
+          26.0317660
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "sa-2021",
+        "name": "Saudi Arabia — Jeddah"
+      },
+      "geometry": {
+        "coordinates": [
+          39.1050760,
+          21.6310530
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "us-2022",
+        "name": "Miami"
+      },
+      "geometry": {
+        "coordinates": [
+          -80.2373710,
+          25.9590920
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "it-1953",
+        "name": "Emilia-Romagna — Imola"
+      },
+      "geometry": {
+        "coordinates": [
+          11.7167010,
+          44.3440560
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "mc-1929",
+        "name": "Monaco"
+      },
+      "geometry": {
+        "coordinates": [
+          7.4212587,
+          43.7350301
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "es-1991",
+        "name": "Spain — Barcelona"
+      },
+      "geometry": {
+        "coordinates": [
+          2.2612210,
+          41.5700340
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "ca-1978",
+        "name": "Canada — Montreal"
+      },
+      "geometry": {
+        "coordinates": [
+          -73.5232460,
+          45.5018160
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "at-1969",
+        "name": "Austria — Red Bull Ring"
+      },
+      "geometry": {
+        "coordinates": [
+          14.7651190,
+          47.2200230
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "gb-1948",
+        "name": "Great Britain — Silverstone"
+      },
+      "geometry": {
+        "coordinates": [
+          -1.0153490,
+          52.0787900
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "be-1925",
+        "name": "Belgium — Spa"
+      },
+      "geometry": {
+        "coordinates": [
+          5.9663453,
+          50.4427453
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "hu-1986",
+        "name": "Hungary — Hungaroring"
+      },
+      "geometry": {
+        "coordinates": [
+          19.2458880,
+          47.5802600
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "nl-1948",
+        "name": "Netherlands — Zandvoort"
+      },
+      "geometry": {
+        "coordinates": [
+          4.5404910,
+          52.3884080
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "it-1922",
+        "name": "Italy — Monza"
+      },
+      "geometry": {
+        "coordinates": [
+          9.2812230,
+          45.6189750
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "az-2016",
+        "name": "Azerbaijan — Baku"
+      },
+      "geometry": {
+        "coordinates": [
+          49.8532470,
+          40.3726880
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "sg-2008",
+        "name": "Singapore — Marina Bay"
+      },
+      "geometry": {
+        "coordinates": [
+          103.8641440,
+          1.2917280
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "us-2012",
+        "name": "USA — COTA"
+      },
+      "geometry": {
+        "coordinates": [
+          -97.6396510,
+          30.1317600
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "mx-1962",
+        "name": "Mexico City"
+      },
+      "geometry": {
+        "coordinates": [
+          -99.0943380,
+          19.4062260
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "br-1940",
+        "name": "Brazil — Interlagos"
+      },
+      "geometry": {
+        "coordinates": [
+          -46.6999050,
+          -23.7037440
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "us-2023",
+        "name": "Las Vegas"
+      },
+      "geometry": {
+        "coordinates": [
+          -115.1612020,
+          36.1099040
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "qa-2004",
+        "name": "Qatar — Lusail"
+      },
+      "geometry": {
+        "coordinates": [
+          51.4496810,
+          25.4890770
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "ae-2009",
+        "name": "Abu Dhabi — Yas Marina"
+      },
+      "geometry": {
+        "coordinates": [
+          54.6054630,
+          24.4699700
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "de-1927",
+        "name": "Nürburgring"
+      },
+      "geometry": {
+        "coordinates": [
+          6.9476320,
+          50.3355370
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "de-1932",
+        "name": "Hockenheim"
+      },
+      "geometry": {
+        "coordinates": [
+          8.5658650,
+          49.3277680
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "fr-1969",
+        "name": "Paul Ricard"
+      },
+      "geometry": {
+        "coordinates": [
+          5.7915710,
+          43.2520200
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "pt-2008",
+        "name": "Portimão"
+      },
+      "geometry": {
+        "coordinates": [
+          -8.6308100,
+          37.2321130
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "tr-2005",
+        "name": "Istanbul"
+      },
+      "geometry": {
+        "coordinates": [
+          29.4061520,
+          40.9521310
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "ru-2014",
+        "name": "Sochi"
+      },
+      "geometry": {
+        "coordinates": [
+          39.9680660,
+          43.4096990
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "it-1914",
+        "name": "Mugello"
+      },
+      "geometry": {
+        "coordinates": [
+          11.3714650,
+          43.9975890
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "my-1999",
+        "name": "Malaysia — Sepang"
+      },
+      "geometry": {
+        "coordinates": [
+          101.7356410,
+          2.7605290
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "fr-1960",
+        "name": "Magny-Cours"
+      },
+      "geometry": {
+        "coordinates": [
+          3.1637100,
+          46.8640760
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "pt-1972",
+        "name": "Estoril"
+      },
+      "geometry": {
+        "coordinates": [
+          -9.3930730,
+          38.7490170
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "ar-1952",
+        "name": "Buenos Aires"
+      },
+      "geometry": {
+        "coordinates": [
+          -58.4612560,
+          -34.6940480
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "za-1961",
+        "name": "Kyalami"
+      },
+      "geometry": {
+        "coordinates": [
+          28.0699210,
+          -25.9987790
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "us-1909",
+        "name": "Indianapolis"
+      },
+      "geometry": {
+        "coordinates": [
+          -86.2388510,
+          39.7931550
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "us-1956",
+        "name": "Watkins Glen"
+      },
+      "geometry": {
+        "coordinates": [
+          -76.9288350,
+          42.3410460
+        ],
+        "type": "Point"
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "type": "start_finish_line",
+        "circuit_id": "br-1977",
+        "name": "Jacarepaguá"
+      },
+      "geometry": {
+        "coordinates": [
+          -43.3952250,
+          -22.9748500
+        ],
+        "type": "Point"
+      }
+    }
+  ]
+}

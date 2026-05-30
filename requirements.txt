@@ -1,0 +1,25 @@
+# F1 Circuit Pipeline — requirements
+# Install with: pip install -r requirements.txt
+#
+# Python >= 3.10 recommended
+
+# Telemetry loading and lap data
+fastf1>=3.3
+
+# Numerical computation and Procrustes alignment
+numpy>=1.26
+
+# HTTP requests (GitHub GeoJSON, Overpass API, Open-Topo-Data)
+requests>=2.31
+
+# Polygon splitting for sea surface generation
+shapely>=2.0
+
+# Cubic spline resampling (track curve smoothing)
+scipy>=1.11
+
+# Hexagonal grid indexing for water mesh generation
+h3>=3.7
+
+# GeoTIFF parsing for OpenTopography raster downloads
+rasterio>=1.3

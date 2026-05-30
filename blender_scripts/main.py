@@ -110,7 +110,7 @@ GEOJSON_DIR = r"C:\Users\Miles\PycharmProjects\F1\output\circuits"
 #     us-1909   Indianapolis
 #     us-1956   Watkins Glen
 #     br-1977   Jacarepaguá
-CIRCUITS_TO_IMPORT = ["nl-1948"]   # None = all circuits
+CIRCUITS_TO_IMPORT = ["mc-1929"]   # None = all circuits
 
 CIRCUITS_EXCLUDE = ["es-2008"]
 
@@ -134,6 +134,7 @@ Z_SCALE = SCALE / METRES_PER_DEGREE  # ~0.000898
 POINT_RESOLUTION_M = 10.0
 WATER_RESOLUTION   = 50.0   # subdivision resolution for water surfaces (metres)
 MIN_WATER_HEX      = 3      # minimum H3 cells a water body must have to be imported
+SEA_STD_THRESHOLD  = 0.001  # Z std dev below which a vertex group is considered sea
 
 # ── Vegetation ────────────────────────────────────────────────────────────────
 # Minimum triangle count for a vegetation polygon to be imported.
@@ -155,6 +156,41 @@ VEG_DENSITIES = {
 }
 VEG_DENSITY_DEFAULT = (0.0, 0.0, 1.0)  # fallback for unmapped tags
 
+# Water / sea depth model — Håkanson power law: depth_m = k * sqrt(area_m²)
+# Area scaling is applied for all types; the per-tag cap prevents physically
+# implausible depths for small or narrow features.
+WATER_DEPTH_K = 0.3   # empirical Håkanson coefficient
+
+# Maximum depression depth (metres) per OSM water_tag.
+# Lookup order matches primary_tag() in water.py: water > natural > landuse > waterway.
+WATER_DEPTH_BY_TAG = {
+    # ── Open sea / coast ───────────────────────────────────────────────────────
+    "sea":          50.0,
+    "ocean":        50.0,
+    # ── Lakes and generic open water ──────────────────────────────────────────
+    "lake":         30.0,
+    "water":        20.0,   # natural=water without a sub-type
+    "pond":          4.0,
+    "oxbow":         3.0,
+    "lagoon":       15.0,
+    "moat":          3.0,
+    # ── Managed / artificial ──────────────────────────────────────────────────
+    "reservoir":    20.0,
+    "basin":         3.0,   # retention / drainage basin — intentionally shallow
+    # ── Wetland ───────────────────────────────────────────────────────────────
+    "wetland":       1.5,
+    # ── Rivers and waterways ──────────────────────────────────────────────────
+    "river":         6.0,
+    "riverbank":     5.0,
+    "canal":         3.0,
+    "dock":         12.0,
+}
+WATER_DEPTH_DEFAULT_M = 8.0   # fallback for unmapped tags
+
+# Fraction of the water body's half-width that is the cosine edge-blend zone.
+# 0.0 = sharp cliff (no taper).  1.0 = full S-curve taper (old behaviour).
+# 0.25 → outer 25% tapers, inner 75% is at full depth (realistic bowl/shelf).
+WATER_EDGE_BLEND = 0.25
 
 # 'POLY' = exact straight segments  |  'NURBS' = smooth interpolation
 CURVE_TYPE = 'NURBS'
@@ -218,6 +254,184 @@ def equirectangular(lon, lat, lon_origin, lat_origin):
     x = (lon - lon_origin) * cos_lat * SCALE
     y = (lat - lat_origin) * SCALE
     return x, y
+
+
+def water_edge_falloff(t):
+    """
+    Displacement factor for water body depth at normalised distance t,
+    where t=0 is the shoreline and t=1 is the deepest interior point.
+
+    The outer WATER_EDGE_BLEND fraction of the width uses a cosine taper
+    (0 → 1).  Everything inward of that zone is at full depth (factor = 1).
+
+    Shape for WATER_EDGE_BLEND=0.25:
+      t  0.00 → factor 0.00  (shoreline — no displacement)
+      t  0.12 → factor 0.50  (mid-taper)
+      t  0.25 → factor 1.00  (inner edge of taper — full depth)
+      t  1.00 → factor 1.00  (centre — full depth, unchanged)
+    """
+    if WATER_EDGE_BLEND <= 0.0 or t >= WATER_EDGE_BLEND:
+        return 1.0
+    tt = t / WATER_EDGE_BLEND          # 0→1 across the edge zone only
+    return 0.5 * (1.0 - math.cos(math.pi * tt))
+
+
+def _make_water_depth_offset_fn(mesh_obj, ring, depth_m, lon_origin, lat_origin):
+    """
+    Build a depth-offset function from the actual, post-island-filtered mesh vertices.
+
+    Using mesh_obj (not the raw H3 triangle list) guarantees that:
+      - Stray mesh fragments that were deleted by island filtering are also
+        excluded from terrain displacement.
+      - Every source position is a vertex that exists in the visible mesh.
+
+    The returned function takes Blender (x, y) and returns the depression
+    in Blender Z-units for that point.  It returns 0 for any point that
+    lies outside the water body polygon (containment is checked with a
+    numpy ray-cast so no bleed onto surrounding land).
+    """
+    if not HAVE_SHAPELY or not ring or len(ring) < 3 or depth_m <= 0:
+        return None
+    if mesh_obj is None or len(mesh_obj.data.vertices) == 0:
+        return None
+
+    try:
+        poly = ShapelyPolygon([(p[0], p[1]) for p in ring])
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+        boundary = poly.boundary
+    except Exception:
+        return None
+
+    cos_lat  = _cos_lat_cache.get(lat_origin) or math.cos(math.radians(lat_origin))
+
+    # Convert surviving mesh vertices → lon/lat, compute boundary distance
+    verts_bl  = [(v.co.x, v.co.y) for v in mesh_obj.data.vertices]
+    verts_geo = [
+        (x / (cos_lat * SCALE) + lon_origin,
+         y / SCALE + lat_origin)
+        for x, y in verts_bl
+    ]
+
+    dists    = [boundary.distance(Point(lon, lat)) for lon, lat in verts_geo]
+    max_dist = max(dists) if dists else 0.0
+
+    # Build (Blender XY) → depth_offset
+    xy_to_offset = {}
+    for (x, y), d in zip(verts_bl, dists):
+        t = min(d / max_dist, 1.0) if max_dist > 1e-12 else 1.0
+        xy_to_offset[(round(x, 5), round(y, 5))] = (
+            depth_m * water_edge_falloff(t) * Z_SCALE
+        )
+
+    if not xy_to_offset:
+        return None
+
+    # Pre-build ring as a flat numpy array for vectorised ray-casting
+    _ring_x = [p[0] for p in ring]
+    _ring_y = [p[1] for p in ring]
+
+    def _contains_batch(lons, lats):
+        """
+        Numpy ray-casting point-in-polygon for arrays of (lon, lat) points.
+        Returns a boolean array, True = inside.
+        """
+        import numpy as _np2
+        inside = _np2.zeros(len(lons), dtype=bool)
+        n = len(_ring_x)
+        for i in range(n):
+            j   = (i + 1) % n
+            xi, yi = _ring_x[i], _ring_y[i]
+            xj, yj = _ring_x[j], _ring_y[j]
+            cond = ((yi > lats) != (yj > lats)) & (
+                lons < (xj - xi) * (lats - yi) / ((yj - yi) + 1e-12) + xi
+            )
+            inside ^= cond
+        return inside
+
+    radius_bu = 90.0 / METRES_PER_DEGREE * SCALE
+
+    try:
+        import numpy as _np
+        from scipy.spatial import cKDTree as _KD
+        _pts     = _np.array(list(xy_to_offset.keys()))
+        _offsets = _np.array(list(xy_to_offset.values()))
+        _tree    = _KD(_pts)
+
+        def depth_fn(px, py):
+            dist, i = _tree.query((px, py))
+            if dist > radius_bu:
+                return 0.0
+            lon = px / (cos_lat * SCALE) + lon_origin
+            lat = py / SCALE + lat_origin
+            inside = False
+            n = len(_ring_x)
+            for k in range(n):
+                j = (k + 1) % n
+                xi, yi = _ring_x[k], _ring_y[k]
+                xj, yj = _ring_x[j], _ring_y[j]
+                if ((yi > lat) != (yj > lat) and
+                        lon < (xj - xi) * (lat - yi) / ((yj - yi) + 1e-12) + xi):
+                    inside = not inside
+            return float(_offsets[i]) if inside else 0.0
+
+        def depth_fn_batch(xs, ys):
+            kd_dists, idxs = _tree.query(_np.column_stack([xs, ys]))
+            result = _offsets[idxs].copy()
+            result[kd_dists > radius_bu] = 0.0
+
+            # Containment check on every candidate terrain vertex
+            active = _np.where(result > 0.0)[0]
+            if active.size:
+                lons = xs[active] / (cos_lat * SCALE) + lon_origin
+                lats = ys[active] / SCALE + lat_origin
+                inside = _contains_batch(lons, lats)
+                result[active[~inside]] = 0.0
+
+            return result
+
+        depth_fn.batch = depth_fn_batch
+
+    except ImportError:
+        def depth_fn(px, py):
+            return 0.0   # scipy required for depth offset
+
+    return depth_fn
+
+
+def project_water_mesh_flat(water_obj, terrain_z_fn, target_z=None):
+    """
+    Flatten all vertices of a water body mesh to a single Z elevation.
+
+    If target_z is given, use it directly (e.g., 0.0 for sea).
+    Otherwise compute mean terrain height across all mesh vertex (x,y)
+    positions using terrain_z_fn (one representative Z per water body).
+
+    A real water surface is always a horizontal plane - never terrain-following.
+    """
+    if water_obj is None:
+        return
+    mesh = water_obj.data
+    if not mesh.vertices:
+        return
+
+    if target_z is None:
+        if terrain_z_fn is None:
+            target_z = 0.0
+        elif HAVE_NUMPY:
+            import numpy as _np
+            xy    = _np.array([(v.co.x, v.co.y) for v in mesh.vertices])
+            batch = getattr(terrain_z_fn, 'batch', None)
+            zs    = batch(xy[:, 0], xy[:, 1]) if batch is not None else \
+                    _np.array([terrain_z_fn(x, y) for x, y in xy])
+            target_z = float(_np.mean(zs))
+        else:
+            zs = [terrain_z_fn(v.co.x, v.co.y) for v in mesh.vertices]
+            target_z = sum(zs) / len(zs)
+
+    for v in mesh.vertices:
+        v.co.z = target_z
+    mesh.update()
 
 
 # =============================================================================
@@ -609,10 +823,13 @@ def build_terrain_mesh(terrain_props, lon_origin, lat_origin,
 
 def build_triangle_mesh(triangles, obj_name, z, lon_origin, lat_origin,
                         feature_type, parent_obj, blender_name, extra_props=None,
-                        terrain_z_fn=None, collection=None):
+                        terrain_z_fn=None, min_hexagons=0, collection=None):
     """
     Build a single merged mesh object from a list of triangles.
     Each triangle is [[lon,lat],[lon,lat],[lon,lat]].
+
+    min_hexagons : if > 0, connected face islands with <= min_hexagons*6 faces
+                  are deleted after merge. Use to remove stray coastline fragments.
     If terrain_z_fn is provided, Z is projected per vertex.
     Otherwise the flat z value is used for all vertices.
     """
@@ -621,28 +838,89 @@ def build_triangle_mesh(triangles, obj_name, z, lon_origin, lat_origin,
     if not triangles:
         return None
 
-    all_verts = []
-    all_faces = []
-    for tri in triangles:
-        base = len(all_verts)
-        for pt in tri:
-            x, y = equirectangular(pt[0], pt[1], lon_origin, lat_origin)
-            pz   = terrain_z_fn(x, y) if terrain_z_fn is not None else z
-            all_verts.append((x, y, pz))
-        all_faces.append((base, base + 1, base + 2))
+    n_tris  = len(triangles)
+    cos_lat = _cos_lat_cache.get(lat_origin) or math.cos(math.radians(lat_origin))
+
+    if HAVE_NUMPY:
+        import numpy as _np
+        # Flatten all triangle points in one shot: shape (n_tris*3, 2)
+        raw = _np.array([[pt[0], pt[1]] for tri in triangles for pt in tri])
+        xs  = (raw[:, 0] - lon_origin) * cos_lat * SCALE
+        ys  = (raw[:, 1] - lat_origin) * SCALE
+
+        batch = getattr(terrain_z_fn, 'batch', None)
+        if batch is not None:
+            zs = batch(xs, ys)
+        elif terrain_z_fn is not None:
+            zs = _np.array([terrain_z_fn(x, y) for x, y in zip(xs, ys)])
+        else:
+            zs = _np.full(len(xs), float(z))
+
+        all_verts = list(zip(xs.tolist(), ys.tolist(), zs.tolist()))
+    else:
+        all_verts = []
+        for tri in triangles:
+            for pt in tri:
+                x  = (pt[0] - lon_origin) * cos_lat * SCALE
+                y  = (pt[1] - lat_origin) * SCALE
+                pz = terrain_z_fn(x, y) if terrain_z_fn is not None else z
+                all_verts.append((x, y, pz))
+
+    all_faces = [(i * 3, i * 3 + 1, i * 3 + 2) for i in range(n_tris)]
 
     me = bpy.data.meshes.new(obj_name)
     me.from_pydata(all_verts, [], all_faces)
     me.update()
 
-    # Merge by distance — 0.01m in Blender units
     merge_dist = 0.01 * Z_SCALE
     bm = _bmesh.new()
     bm.from_mesh(me)
     _bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=merge_dist)
+
+    # Remove disconnected face islands smaller than min_hexagons hexagons.
+    # Each H3 hex produces 6 triangular faces, so the threshold is min_hexagons*6.
+    if min_hexagons > 0:
+        bm.faces.ensure_lookup_table()
+        visited  = set()
+        islands  = []
+        for seed in bm.faces:
+            if seed in visited:
+                continue
+            island = []
+            stack  = [seed]
+            while stack:
+                f = stack.pop()
+                if f in visited:
+                    continue
+                visited.add(f)
+                island.append(f)
+                for edge in f.edges:
+                    for lf in edge.link_faces:
+                        if lf not in visited:
+                            stack.append(lf)
+            islands.append(island)
+
+        min_faces   = min_hexagons * 6
+        to_delete   = [f for isl in islands if len(isl) <= min_faces for f in isl]
+        n_removed   = len([isl for isl in islands if len(isl) <= min_faces])
+        if to_delete:
+            _bmesh.ops.delete(bm, geom=to_delete, context='FACES')
+            # delete(FACES) leaves orphaned vertices — remove them too so their
+            # positions cannot enter the depth-offset KDTree and cause phantom
+            # terrain depression at the deleted island locations.
+            orphaned = [v for v in bm.verts if not v.link_faces]
+            if orphaned:
+                _bmesh.ops.delete(bm, geom=orphaned, context='VERTS')
+            print(f"  [island filter] '{obj_name}': removed {n_removed} island(s) "
+                  f"(<= {min_hexagons} hexes, {len(to_delete)} faces)")
+
     bm.to_mesh(me)
     bm.free()
     me.update()
+
+    # Return None if the mesh is now empty after island filtering
+    if len(me.vertices) == 0:
+        return None
 
     obj = bpy.data.objects.new(obj_name, me)
     obj["circuit_id"]   = blender_name
@@ -651,91 +929,68 @@ def build_triangle_mesh(triangles, obj_name, z, lon_origin, lat_origin,
         for k, v in extra_props.items():
             obj[k] = v
     _col(collection).objects.link(obj)
-    obj.location.z = z
-
-    world_mat        = obj.matrix_world.copy()
-    obj.parent       = parent_obj
-    obj.matrix_world = world_mat
-
-    bpy.ops.object.select_all(action='DESELECT')
-    obj.select_set(True)
-    bpy.context.view_layer.objects.active = obj
-    bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='BOUNDS')
+    obj.parent = parent_obj
 
     return obj
 
 
-def build_sea_curve(feat, lon_origin, lat_origin, parent_obj, blender_name, collection=None):
-    """Build a sea polygon as a flat 2D NGON-filled curve at Z=0,
-    plus a merged triangle mesh from H3 cells if available."""
-    geom = feat.get("geometry", {})
-    if not geom or geom.get("type") != "Polygon":
-        return
-    rings = geom.get("coordinates", [])
-    if not rings or len(rings[0]) < 3:
-        return
-    ring      = rings[0]
-    pts       = ring[:-1] if ring[0] == ring[-1] else ring
-    props = feat.get("properties", {})
-    name  = f"{blender_name} - Sea"
+def build_sea_curve(feat, lon_origin, lat_origin, parent_obj, blender_name,
+                    depth_m=0.0, ring=None, collection=None):
+    """
+    Build sea H3 hex mesh at Z=0 (flat). Z is set to sea level (0) by
+    project_water_mesh_flat after this returns. Depth displacement is
+    handled separately by apply_water_depth_to_terrain.
+    Returns (mesh_obj, depth_offset_fn) — either may be None on failure.
+    """
+    props     = feat.get("properties", {})
+    sea_index = props.get("sea_index", 0)
+    label     = chr(65 + sea_index)
+    obj_base  = f"{blender_name} - Sea {label}"
 
-    curve            = bpy.data.curves.new(name, type='CURVE')
-    curve.dimensions = '2D'
-    curve.fill_mode  = 'FRONT'
-    spline           = curve.splines.new('POLY')
-    spline.points.add(len(pts) - 1)
-    spline.use_cyclic_u = True
-    for i, pt in enumerate(pts):
-        x, y = equirectangular(pt[0], pt[1], lon_origin, lat_origin)
-        spline.points[i].co = (x, y, 0.0, 1.0)
-
-    obj = bpy.data.objects.new(name, curve)
-    obj["circuit_id"]   = blender_name
-    obj["feature_type"] = "sea"
-    _col(collection).objects.link(obj)
-    world_mat        = obj.matrix_world.copy()
-    obj.parent       = parent_obj
-    obj.matrix_world = world_mat
-    attach_nodegroup(obj, "Sea")
-
-    bpy.ops.object.select_all(action='DESELECT')
-    obj.select_set(True)
-    bpy.context.view_layer.objects.active = obj
-    bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='BOUNDS')
-    print(f"  [{name}]  {len(pts)} pts")
-
-    # Build triangle mesh from H3 cells if present and above minimum hex count
     triangles = props.get("triangles", [])
-    if triangles and len(triangles) // 6 >= MIN_WATER_HEX:
-        mesh_name = f"{blender_name} - Sea Mesh"
-        mesh_obj  = build_triangle_mesh(
-            triangles, mesh_name, 0.0,
-            lon_origin, lat_origin,
-            "sea_mesh", parent_obj, blender_name,
-            extra_props={},
-            collection=collection)
-        if mesh_obj:
-            attach_nodegroup(mesh_obj, "Sea")
-            print(f"  [{mesh_name}]  {len(triangles)} tris  "
-                  f"{len(mesh_obj.data.vertices)} verts (merged)")
-            # Plane was a construction object — clean up now the mesh exists
-            curve_data = obj.data
-            bpy.data.objects.remove(obj, do_unlink=True)
-            bpy.data.curves.remove(curve_data)
-        else:
-            print(f"  [{mesh_name}]  mesh build failed — keeping curve fallback")
+    if not triangles or len(triangles) // 6 < MIN_WATER_HEX:
+        return None, None
+
+    mesh_name = f"{obj_base} Mesh"
+    mesh_obj  = build_triangle_mesh(
+        triangles, mesh_name, 0.0,
+        lon_origin, lat_origin,
+        "sea", parent_obj, blender_name,
+        extra_props={"sea_index": sea_index},
+        terrain_z_fn=None,
+        min_hexagons=7,
+        collection=collection)
+
+    if mesh_obj is None:
+        print(f"  [{mesh_name}]  mesh build failed or empty after island filter - skipped")
+        return None, None
+
+    # Build depth fn from actual surviving mesh vertices so deleted
+    # islands cannot cause phantom terrain depressions.
+    depth_fn = _make_water_depth_offset_fn(
+        mesh_obj, ring or [], depth_m, lon_origin, lat_origin)
+
+    attach_nodegroup(mesh_obj, "Sea")
+    print(f"  [{mesh_name}]  {len(triangles)} tris  "
+          f"{len(mesh_obj.data.vertices)} verts (merged)  depth={depth_m:.1f}m")
+    return mesh_obj, depth_fn
 
 
 def build_water_curve(feat, lon_origin, lat_origin, parent_obj, blender_name,
-                      tag_counts, terrain_z_fn=None, collection=None):
-    """Build a water body hex mesh. Skips entirely if no H3 triangles exist."""
+                      tag_counts, depth_m=0.0, ring=None,
+                      collection=None):
+    """
+    Build a water body hex mesh at Z=0 (flat). Z is projected to mean terrain
+    height by project_water_mesh_flat after this returns. Depth displacement is
+    handled separately by apply_water_depth_to_terrain.
+    Returns (mesh_obj, depth_offset_fn) — either may be None on failure.
+    """
     props     = feat.get("properties", {})
     water_tag = props.get("water_tag", "water")
 
-    # Only hex meshes — skip bodies with insufficient triangle data
     triangles = props.get("triangles", [])
     if not triangles or len(triangles) // 6 < MIN_WATER_HEX:
-        return
+        return None, None
 
     tag_counts[water_tag] = tag_counts.get(water_tag, 0) + 1
     obj_name  = f"{blender_name} - Water - {water_tag} - {tag_counts[water_tag]}"
@@ -746,15 +1001,68 @@ def build_water_curve(feat, lon_origin, lat_origin, parent_obj, blender_name,
         lon_origin, lat_origin,
         "water_mesh", parent_obj, blender_name,
         extra_props={"water_tag": water_tag},
-        terrain_z_fn=terrain_z_fn,
+        terrain_z_fn=None,
+        min_hexagons=7,
         collection=collection)
 
-    if mesh_obj:
-        attach_nodegroup(mesh_obj, "Water")
-        print(f"  [{mesh_name}]  {len(triangles)} tris  "
-              f"{len(mesh_obj.data.vertices)} verts (merged)")
+    if mesh_obj is None:
+        print(f"  [{mesh_name}]  mesh build failed or empty after island filter - skipped")
+        return None, None
+
+    depth_fn = _make_water_depth_offset_fn(
+        mesh_obj, ring or [], depth_m, lon_origin, lat_origin)
+
+    attach_nodegroup(mesh_obj, "Water")
+    print(f"  [{mesh_name}]  {len(triangles)} tris  "
+          f"{len(mesh_obj.data.vertices)} verts (merged)  depth={depth_m:.1f}m")
+    return mesh_obj, depth_fn
+
+
+def apply_water_depth_to_terrain(terrain_obj, depth_fns, blender_name):
+    """
+    Depress terrain vertices by the combined depth offset from all water bodies.
+
+    depth_fns : list of callables returned by _make_water_depth_offset_fn.
+                Each returns a depression amount in Blender Z-units for a given
+                (x, y) position. Supports a .batch(xs, ys) numpy path.
+
+    For each terrain vertex the maximum offset across all water bodies is used
+    (lakes and sea can overlap; the deeper one wins). Vertices with zero offset
+    are untouched (land outside all water footprints).
+    """
+    if terrain_obj is None or not depth_fns:
+        return
+
+    mesh = terrain_obj.data
+    n    = len(mesh.vertices)
+
+    if HAVE_NUMPY:
+        import numpy as _np
+        xs = _np.array([v.co.x for v in mesh.vertices])
+        ys = _np.array([v.co.y for v in mesh.vertices])
+
+        total = _np.zeros(n)
+        for fn in depth_fns:
+            batch = getattr(fn, 'batch', None)
+            offsets = batch(xs, ys) if batch is not None else \
+                      _np.array([fn(x, y) for x, y in zip(xs, ys)])
+            _np.maximum(total, offsets, out=total)
+
+        moved = 0
+        for i, v in enumerate(mesh.vertices):
+            if total[i] > 0.0:
+                v.co.z -= total[i]
+                moved  += 1
     else:
-        print(f"  [{mesh_name}]  mesh build failed — skipped")
+        moved = 0
+        for v in mesh.vertices:
+            offset = max(fn(v.co.x, v.co.y) for fn in depth_fns)
+            if offset > 0.0:
+                v.co.z -= offset
+                moved  += 1
+
+    mesh.update()
+    print(f"  [{blender_name}] water depth: {moved} terrain verts depressed")
 
 
 def build_bounding_wall(terrain_props, lon_origin, lat_origin,
@@ -838,6 +1146,218 @@ def build_bounding_wall(terrain_props, lon_origin, lat_origin,
     vg.add(bot_vi, 1.0, 'REPLACE')
 
     print(f"  [{name}]  Z {z_bottom:.4f} → {z_top:.4f}  bottom_verts={len(bot_vi)}")
+
+
+def _polygon_area_m2(ring):
+    """Shoelace area of a [[lon, lat], ...] ring in square metres."""
+    n       = len(ring)
+    if n < 3:
+        return 0.0
+    lat_ref     = sum(p[1] for p in ring) / n
+    m_per_deg_lon = METRES_PER_DEGREE * math.cos(math.radians(lat_ref))
+    m_per_deg_lat = METRES_PER_DEGREE
+    area = 0.0
+    for i in range(n):
+        x0 = ring[i][0]         * m_per_deg_lon
+        y0 = ring[i][1]         * m_per_deg_lat
+        x1 = ring[(i+1) % n][0] * m_per_deg_lon
+        y1 = ring[(i+1) % n][1] * m_per_deg_lat
+        area += x0 * y1 - x1 * y0
+    return abs(area) / 2.0
+
+
+def extrude_flat_groups(terrain_obj, groups, blender_name, offsets=None):
+    """
+    Depress Z vertices for the given vertex groups on terrain_obj.
+
+    offsets : dict {group_name: z_offset_blender_units} giving the maximum
+              depression (negative value) for each group. Groups absent from
+              the dict receive no displacement.
+
+    Two falloff strategies are used:
+    - Groups named "W..." (water bodies): use the per-vertex weight stored in
+      the vertex group by assign_sea_vertex_groups. The weight is a cosine
+      falloff derived from Shapely distance to the water polygon boundary
+      (0 at the edge, 1 at the centre). Works correctly for narrow features
+      (rivers, canals) where BFS hop-count would give every vertex factor=0.
+    - All other groups (sea "A", "B", ...): BFS hop-count from the transition
+      boundary, then cosine falloff normalised to max hop depth.
+    """
+    from collections import deque as _deque
+    import bmesh as _bm
+
+    if not groups or terrain_obj is None:
+        return
+
+    offsets = offsets or {}
+    mesh    = terrain_obj.data
+
+    # ── Build adjacency once ──────────────────────────────────────────────
+    bm = _bm.new()
+    bm.from_mesh(mesh)
+    bm.edges.ensure_lookup_table()
+
+    adjacency = {v.index: set() for v in bm.verts}
+    for edge in bm.edges:
+        a, b = edge.verts[0].index, edge.verts[1].index
+        adjacency[a].add(b)
+        adjacency[b].add(a)
+    bm.free()
+
+    # ── Precompute group membership with per-vertex weights ──────────────
+    vg_names     = {vg.name: vg.index for vg in terrain_obj.vertex_groups}
+    # group_members: {vg_index: {vert_index: weight}}
+    group_members = {vg_names[g]: {} for g in groups if g in vg_names}
+    for v in mesh.vertices:
+        for g in v.groups:
+            if g.group in group_members:
+                group_members[g.group][v.index] = g.weight
+
+    # ── Helper: look up a group and return (z_offset, in_group) or None ────
+    def _get_group(group_name):
+        if group_name not in vg_names:
+            print(f"  [{blender_name}] group '{group_name}' not found — skipping")
+            return None, None
+        z_off = offsets.get(group_name)
+        if z_off is None:
+            print(f"  [{blender_name} - depress] '{group_name}': no offset — skipping")
+            return None, None
+        ig = group_members.get(vg_names[group_name], {})
+        if not ig:
+            print(f"  [{blender_name} - depress] '{group_name}': EMPTY — no vertices in group")
+            return None, None
+        return z_off, ig
+
+    # ── Pass 1 — water body groups (W*), processed FIRST ─────────────────
+    # Water groups use pre-computed cosine weights (Shapely boundary
+    # distance).  They must run before sea groups so that inland water
+    # bodies (e.g. Albert Park Lake, Melbourne) are not clobbered by the
+    # sea BFS falloff even when the sea polygon happens to contain them.
+    water_modified = set()   # vertex indices already moved by a water group
+
+    for group_name in groups:
+        if not group_name.startswith("W"):
+            continue
+        z_offset, in_group = _get_group(group_name)
+        if z_offset is None:
+            continue
+        depth_m = abs(z_offset) / Z_SCALE
+        moved   = 0
+        for v in mesh.vertices:
+            if v.index not in in_group:
+                continue
+            factor = in_group[v.index]     # pre-computed cosine [0, 1]
+            v.co.z += z_offset * factor
+            water_modified.add(v.index)
+            moved += 1
+        max_w = max(in_group.values(), default=0.0)
+        print(f"  [{blender_name} - depress] '{group_name}': {moved} verts  "
+              f"max_weight={max_w:.3f}  depth={depth_m:.1f}m")
+
+    # ── Pass 2 — sea / other groups, skip water-modified vertices ────────
+    # BFS hop-count from the group's transition boundary, cosine falloff.
+    # Vertices already moved by a water group are left untouched so inland
+    # lakes / rivers are not double-depressed by the surrounding sea polygon.
+    for group_name in groups:
+        if group_name.startswith("W"):
+            continue
+        z_offset, in_group = _get_group(group_name)
+        if z_offset is None:
+            continue
+        depth_m = abs(z_offset) / Z_SCALE
+
+        in_group_set = set(in_group.keys())
+        transition_boundary = {vi for vi in in_group_set
+                                if any(nb not in in_group_set
+                                       for nb in adjacency[vi])}
+
+        hop_dist = {}
+        queue    = _deque()
+        for vi in transition_boundary:
+            hop_dist[vi] = 0
+            queue.append(vi)
+        while queue:
+            vi   = queue.popleft()
+            dist = hop_dist[vi]
+            for nb in adjacency[vi]:
+                if nb in in_group_set and nb not in hop_dist:
+                    hop_dist[nb] = dist + 1
+                    queue.append(nb)
+
+        max_hop = max(hop_dist.values(), default=1) or 1
+        moved   = 0
+        for v in mesh.vertices:
+            if v.index not in in_group_set:
+                continue
+            if v.index in water_modified:
+                continue    # water group already handled this vertex
+            hops   = hop_dist.get(v.index, max_hop)
+            t      = min(hops / max_hop, 1.0)
+            factor = water_edge_falloff(t)
+            v.co.z += z_offset * factor
+            moved  += 1
+
+        print(f"  [{blender_name} - depress] '{group_name}': {moved} verts  "
+                  f"max_hop={max_hop}  depth={depth_m:.1f}m")
+
+    mesh.update()
+
+
+def identify_sea_vertex_group(terrain_obj, std_dev_threshold=SEA_STD_THRESHOLD):
+    """
+    Identify sea vertex groups by finding all groups whose Z standard
+    deviation falls below std_dev_threshold. Water surfaces are flat
+    (std dev ≈ 0), land has elevation variation.
+
+    Stores the list of sea group names as a custom property 'sea_groups'
+    on the terrain object.
+    """
+    if terrain_obj is None or terrain_obj.type != 'MESH':
+        return []
+
+    mesh      = terrain_obj.data
+    results   = []
+    sea_groups = []
+
+    for vg in terrain_obj.vertex_groups:
+        # W* groups are water bodies — never coastline/sea groups.
+        # They are flat for the same reason (H3 cells over water) so they
+        # would always pass the std_z threshold and get double-depressed.
+        if vg.name.startswith("W"):
+            continue
+        vg_idx = vg.index
+        zs     = [v.co.z for v in mesh.vertices
+                  if any(g.group == vg_idx for g in v.groups)]
+        if not zs:
+            continue
+        n      = len(zs)
+        mean_z = sum(zs) / n
+        std_z  = math.sqrt(sum((z - mean_z) ** 2 for z in zs) / n)
+        results.append((vg.name, std_z, n))
+
+    results.sort(key=lambda r: r[1])
+
+    for name, std_z, n in results:
+        is_sea = std_z < std_dev_threshold
+        tag    = " <- sea" if is_sea else ""
+        print(f"  [sea id] group '{name}':  n={n}  std_z={std_z:.6f}{tag}")
+        if is_sea:
+            sea_groups.append(name)
+
+    if sea_groups:
+        print(f"  [sea id] → sea groups: {sea_groups}")
+    else:
+        print(f"  [sea id] → no groups below threshold {std_dev_threshold} "
+              f"(lowest was {results[0][1]:.6f} '{results[0][0]}')")
+
+    terrain_obj["sea_groups"] = str(sea_groups)
+    return sea_groups
+
+
+STREET_HIGHWAY_TYPES = {
+    "motorway", "trunk", "primary", "secondary",
+    "tertiary", "residential", "service",
+}
 
 
 def build_street_curve(feat, lon_origin, lat_origin, terrain_z_fn,
@@ -937,17 +1457,32 @@ def build_vegetation(feat, lon_origin, lat_origin, terrain_z_fn,
     else:
         obj_name = f"{blender_name} - Veg - {veg_tag}"
 
-    # Build mesh from H3 triangles, project Z onto terrain
     import bmesh as _bm
-    all_verts = []
-    all_faces = []
-    for tri in tris:
-        base = len(all_verts)
-        for pt in tri:
-            px, py = equirectangular(pt[0], pt[1], lon_origin, lat_origin)
-            pz     = terrain_z_fn(px, py) if terrain_z_fn else 0.0
-            all_verts.append((px, py, pz))
-        all_faces.append((base, base + 1, base + 2))
+    cos_lat = _cos_lat_cache.get(lat_origin) or math.cos(math.radians(lat_origin))
+
+    if HAVE_NUMPY:
+        import numpy as _np
+        raw   = _np.array([[pt[0], pt[1]] for tri in tris for pt in tri])
+        xs    = (raw[:, 0] - lon_origin) * cos_lat * SCALE
+        ys    = (raw[:, 1] - lat_origin) * SCALE
+        batch = getattr(terrain_z_fn, 'batch', None)
+        if batch is not None:
+            zs = batch(xs, ys)
+        elif terrain_z_fn is not None:
+            zs = _np.array([terrain_z_fn(x, y) for x, y in zip(xs, ys)])
+        else:
+            zs = _np.zeros(len(xs))
+        all_verts = list(zip(xs.tolist(), ys.tolist(), zs.tolist()))
+    else:
+        all_verts = []
+        for tri in tris:
+            for pt in tri:
+                px = (pt[0] - lon_origin) * cos_lat * SCALE
+                py = (pt[1] - lat_origin) * SCALE
+                pz = terrain_z_fn(px, py) if terrain_z_fn else 0.0
+                all_verts.append((px, py, pz))
+
+    all_faces = [(i * 3, i * 3 + 1, i * 3 + 2) for i in range(len(tris))]
 
     me = bpy.data.meshes.new(obj_name)
     me.from_pydata(all_verts, [], all_faces)
@@ -982,6 +1517,296 @@ def build_vegetation(feat, lon_origin, lat_origin, terrain_z_fn,
 
     print(f"  [{obj_name}]  {len(tris)} tris  {len(me.vertices)} verts  "
           f"tree={tree_d:.1f}  bush={bush_d:.1f}  grass={grass_d:.1f}")
+
+
+def transfer_vertex_groups(src_obj, dst_obj):
+    """
+    Transfer vertex group membership from src_obj to dst_obj by proximity.
+    For each vertex in dst_obj, finds the nearest vertex in src_obj and
+    copies its group memberships.
+    Uses cKDTree for fast nearest-neighbour lookup.
+    """
+    try:
+        from scipy.spatial import cKDTree
+    except ImportError:
+        print("  [transfer VG] scipy not available — skipping")
+        return
+
+    if not src_obj.vertex_groups:
+        return
+
+    src_mesh = src_obj.data
+    dst_mesh = dst_obj.data
+
+    # Build KDTree from src vertex positions
+    src_coords = [(v.co.x, v.co.y, v.co.z) for v in src_mesh.vertices]
+    tree       = cKDTree(src_coords)
+
+    # Build src group membership: {vert_index: [(group_index, weight), ...]}
+    src_groups = {}
+    for v in src_mesh.vertices:
+        if v.groups:
+            src_groups[v.index] = [(g.group, g.weight) for g in v.groups]
+
+    if not src_groups:
+        return
+
+    # Recreate vertex groups on dst_obj matching src_obj names
+    vg_map = {}   # src group index -> dst group
+    for vg in src_obj.vertex_groups:
+        if vg.name not in [g.name for g in dst_obj.vertex_groups]:
+            dst_vg = dst_obj.vertex_groups.new(name=vg.name)
+        else:
+            dst_vg = dst_obj.vertex_groups[vg.name]
+        vg_map[vg.index] = dst_vg
+
+    # Query nearest src vert for each dst vert
+    dst_coords = [(v.co.x, v.co.y, v.co.z) for v in dst_mesh.vertices]
+    _, indices  = tree.query(dst_coords)
+
+    # Accumulate assignments per group
+    group_assignments = {vg.index: [] for vg in dst_obj.vertex_groups}
+    for dst_idx, src_idx in enumerate(indices):
+        for src_gi, weight in src_groups.get(src_idx, []):
+            if src_gi in vg_map:
+                dst_gi = vg_map[src_gi].index
+                group_assignments[dst_gi].append((dst_idx, weight))
+
+    for dst_gi, assignments in group_assignments.items():
+        if assignments:
+            vg = dst_obj.vertex_groups[dst_gi]
+            vert_ids = [a[0] for a in assignments]
+            vg.add(vert_ids, 1.0, 'REPLACE')
+
+    print(f"  [transfer VG] {len(src_obj.vertex_groups)} groups "
+          f"transferred from '{src_obj.name}' → '{dst_obj.name}'")
+
+
+def assign_sea_vertex_groups(terrain_obj, sea_feats, water_feats,
+                             lon_origin, lat_origin):
+    """
+    Assign vertex groups on terrain_obj:
+    - Sea polygons → groups named "A", "B", "C" ...
+    - Water body polygons → groups named "W1", "W2", "W3" ...
+
+    Sea containment uses the OSM polygon outer ring in lon/lat space.
+    Water body containment is built from the same H3 triangles used to
+    construct the water mesh object — this means the vertex group boundary
+    exactly matches the water body's XY footprint in Blender.
+    """
+    if terrain_obj is None:
+        return
+
+    if not HAVE_SHAPELY:
+        print("  [vertex groups] shapely not available — skipping")
+        return
+
+    cos_lat = _cos_lat_cache.get(lat_origin)
+    if cos_lat is None:
+        cos_lat = math.cos(math.radians(lat_origin))
+        _cos_lat_cache[lat_origin] = cos_lat
+
+    # ── Convert all terrain vertices to lon/lat once ──────────────────────
+    t_verts    = terrain_obj.data.vertices
+    t_lonlat   = [(v.co.x / (cos_lat * SCALE) + lon_origin,
+                   v.co.y / SCALE             + lat_origin)
+                  for v in t_verts]
+    sea_claimed = set()   # indices claimed by sea — skipped for water bodies
+
+    # ── Sea groups: elevation-based assignment ────────────────────────────
+    # Using polygon containment on the convex hull geometry ring is unreliable
+    # because the hull may include land vertices with positive Z, pushing the
+    # group's Z std dev above SEA_STD_THRESHOLD and preventing displacement.
+    # Instead we assign directly by terrain vertex elevation — consistent with
+    # the elevation threshold used in master.py to generate sea H3 cells.
+    SEA_Z_THRESHOLD = 1.0 * Z_SCALE   # 1 metre in Blender units
+    sea_assigned = {}
+
+    for feat in sorted(sea_feats or [],
+                       key=lambda f: (f.get("properties") or {}).get("sea_index", 0)):
+        idx   = (feat.get("properties") or {}).get("sea_index", len(sea_assigned))
+        label = chr(65 + idx)
+
+        indices = [v.index for v in terrain_obj.data.vertices
+                   if v.co.z <= SEA_Z_THRESHOLD]
+        if indices:
+            vg = terrain_obj.vertex_groups.new(name=label)
+            vg.add(indices, 1.0, 'REPLACE')
+            sea_claimed.update(indices)
+            sea_assigned[label] = len(indices)
+
+    # ── Water body groups: nearest-neighbour from water mesh vertices ─────
+    # For each unique triangle vertex in the water body mesh, find the
+    # nearest terrain vertex. This directly maps "the same XY positions as
+    # the water body" onto the terrain regardless of grid resolution, so
+    # narrow features (rivers, canals) are fully covered.
+    #
+    # Threshold: half a typical terrain grid step (~30 m → 0.000270 deg).
+    # A terrain vertex is claimed if any water mesh vertex is within
+    # WATER_NN_THRESHOLD degrees of it.
+    WATER_NN_THRESHOLD = 0.0003   # ≈ 33 m
+
+    water_assigned = {}
+    try:
+        import numpy as _np
+        from scipy.spatial import cKDTree as _cKDTree
+
+        t_arr      = _np.array(t_lonlat)
+        terrain_kd = _cKDTree(t_arr)
+
+        for i, feat in enumerate(water_feats or []):
+            label = f"W{i+1}"
+            tris  = (feat.get("properties") or {}).get("triangles", [])
+            if not tris:
+                continue
+
+            # Collect unique lon/lat positions from the triangle vertices
+            w_set = set()
+            for tri in tris:
+                for pt in tri[:3]:
+                    w_set.add((round(pt[0], 7), round(pt[1], 7)))
+            if not w_set:
+                continue
+
+            w_arr          = _np.array(list(w_set))
+            dists, indices = terrain_kd.query(w_arr, k=1)
+
+            # Do NOT exclude sea_claimed here — a sea polygon may overlap
+            # inland water bodies (e.g. Port Phillip Bay polygon covering
+            # Albert Park Lake in Melbourne).  Water body groups are
+            # processed BEFORE sea groups in extrude_flat_groups, which
+            # then skips already-water-modified vertices in the sea pass.
+            claimed = list({int(idx) for d, idx in zip(dists, indices)
+                            if d < WATER_NN_THRESHOLD})
+            if claimed:
+                vg = terrain_obj.vertex_groups.new(name=label)
+                # Assign per-vertex weights based on Shapely distance to polygon
+                # boundary — ONLY for terrain vertices that lie INSIDE the polygon.
+                #
+                # Why inside-only?  The NN threshold (~33 m) may capture terrain
+                # vertices that are just outside the polygon edge.  Those must get
+                # weight = 0 so no terrain displacement appears outside the water
+                # body.  Vertices exactly at the edge (distance ≈ 0) also get
+                # weight ≈ 0 (border vertices don't move).  Only interior vertices
+                # receive a cosine-falloff weight that peaks at 1.0 at the centre.
+                #
+                # This also works for narrow features (rivers, canals) where every
+                # terrain vertex is a BFS grid-boundary vertex: the geometric
+                # distance to the polygon edge still varies across the width.
+                try:
+                    from shapely.ops import unary_union as _uu
+
+                    # ── Primary: build containment geometry from the H3
+                    # water triangles themselves.  This is more reliable than
+                    # reconstructing from the GeoJSON ring coordinates because:
+                    #  • The H3 tris ARE the water mesh — exact match guaranteed
+                    #  • No winding-order or polygon-validity surprises
+                    #  • Islands inside the lake are naturally excluded (their
+                    #    H3 cells were not tagged as water, so no triangles there)
+                    tri_shapes = []
+                    for tri in tris:
+                        if len(tri) >= 3:
+                            tri_shapes.append(
+                                ShapelyPolygon([(tri[j][0], tri[j][1])
+                                               for j in range(3)])
+                            )
+
+                    wpoly   = _uu(tri_shapes) if tri_shapes else None
+                    wbnd    = wpoly.boundary  if wpoly   else None
+                    prep_wp = _prep(wpoly)    if wpoly   else None
+
+                    # ── Fallback: GeoJSON polygon ring (used when wpoly is
+                    # None, or as cross-check when inside_dists is empty)
+                    geom       = feat.get("geometry", {})
+                    coords     = geom.get("coordinates") or []
+                    outer_ring = coords[0] if coords else []
+                    hole_rings = coords[1:] if len(coords) > 1 else []
+                    if len(outer_ring) >= 3:
+                        wpoly_ring = ShapelyPolygon(
+                            [(p[0], p[1]) for p in outer_ring],
+                            [[(p[0], p[1]) for p in h] for h in hole_rings],
+                        )
+                    else:
+                        wpoly_ring = None
+
+                    # If unary_union failed, fall back to the ring polygon
+                    if wpoly is None and wpoly_ring is not None:
+                        wpoly   = wpoly_ring
+                        wbnd    = wpoly.boundary
+                        prep_wp = _prep(wpoly)
+
+                    if prep_wp is not None:
+                        inside_dists = {}
+                        for vi in claimed:
+                            pt = Point(t_lonlat[vi][0], t_lonlat[vi][1])
+                            if prep_wp.covers(pt):
+                                inside_dists[vi] = wbnd.distance(pt)
+
+                        # If triangle-union gave 0 inside verts, retry with
+                        # the ring polygon — useful when Shapely's unary_union
+                        # produces a geometry whose boundary doesn't quite
+                        # cover the terrain vertex positions.
+                        if not inside_dists and wpoly_ring is not None:
+                            prep_ring = _prep(wpoly_ring)
+                            ring_bnd  = wpoly_ring.boundary
+                            for vi in claimed:
+                                pt = Point(t_lonlat[vi][0], t_lonlat[vi][1])
+                                if prep_ring.covers(pt):
+                                    inside_dists[vi] = ring_bnd.distance(pt)
+
+                        max_d    = max(inside_dists.values()) if inside_dists else 0.0
+                        non_zero = sum(1 for d in inside_dists.values() if d > 1e-12)
+                        print(f"  [{terrain_obj.name}] {label}: claimed={len(claimed)}"
+                              f"  inside={len(inside_dists)}  max_d={max_d:.2e}"
+                              f"  non_zero_w={non_zero}")
+                        if max_d > 1e-12:
+                            for vi, d in inside_dists.items():
+                                t = min(d / max_d, 1.0)
+                                w = water_edge_falloff(t)
+                                vg.add([vi], w, 'REPLACE')
+                        elif inside_dists:
+                            # All inside vertices exactly on boundary (max_d≈0):
+                            # assign uniform weight so at least some depression
+                            # is visible.
+                            vg.add(list(inside_dists.keys()), 1.0, 'REPLACE')
+                        # else: no inside vertices — group remains empty
+                    else:
+                        # No geometry could be built at all
+                        vg.add(list(claimed), 1.0, 'REPLACE')
+                except Exception as _exc:
+                    # Shapely failed — fall back to uniform weight
+                    print(f"  [{terrain_obj.name}] {label}: Shapely exception — {_exc}")
+                    vg.add(list(claimed), 1.0, 'REPLACE')
+                water_assigned[label] = len(claimed)
+
+    except ImportError:
+        # scipy unavailable — fall back to polygon containment
+        for i, feat in enumerate(water_feats or []):
+            label = f"W{i+1}"
+            geom  = feat.get("geometry", {})
+            if geom.get("type") != "Polygon":
+                continue
+            rings = geom.get("coordinates", [])
+            if not rings or len(rings[0]) < 3:
+                continue
+            try:
+                poly     = ShapelyPolygon([(p[0], p[1]) for p in rings[0]])
+                prepared = _prep(poly)
+            except Exception:
+                continue
+            indices = [i for i, (lon, lat) in enumerate(t_lonlat)
+                       if i not in sea_claimed and prepared.covers(Point(lon, lat))]
+            if indices:
+                vg = terrain_obj.vertex_groups.new(name=label)
+                vg.add(indices, 1.0, 'REPLACE')
+                water_assigned[label] = len(indices)
+
+    if sea_assigned:
+        totals = ", ".join(f"{l}:{n}" for l, n in sea_assigned.items())
+        print(f"  [{terrain_obj.name}]  sea groups:   {totals}")
+    if water_assigned:
+        totals = ", ".join(f"{l}:{n}" for l, n in water_assigned.items())
+        print(f"  [{terrain_obj.name}]  water groups: {totals}")
 
 
 def build_structures_mesh(structures_props, terrain_z_fn, lon_origin, lat_origin,
@@ -1067,37 +1892,49 @@ def build_terrain_lookup(terrain_props, lon_origin, lat_origin):
     lat_min = terrain_props["lat_min"]
     lat_max = terrain_props["lat_max"]
 
-    # Precompute Blender XY for grid corners
     x_min, y_min = equirectangular(lon_min, lat_min, lon_origin, lat_origin)
     x_max, y_max = equirectangular(lon_max, lat_max, lon_origin, lat_origin)
     x_range = x_max - x_min
     y_range = y_max - y_min
 
+    # Flat elevation list avoids per-call list indexing overhead
+    ele_flat = [pt[2] if len(pt) > 2 and pt[2] is not None else 0.0 for pt in points]
+
     def terrain_z(px, py):
-        col_f = (px - x_min) / x_range * (n_lon - 1) if x_range != 0 else 0.0
-        row_f = (py - y_min) / y_range * (n_lat - 1) if y_range != 0 else 0.0
-
-        col_f = max(0.0, min(n_lon - 1, col_f))
-        row_f = max(0.0, min(n_lat - 1, row_f))
-
+        col_f = max(0.0, min(n_lon - 1,
+                    (px - x_min) / x_range * (n_lon - 1) if x_range else 0.0))
+        row_f = max(0.0, min(n_lat - 1,
+                    (py - y_min) / y_range * (n_lat - 1) if y_range else 0.0))
         col0 = int(col_f); col1 = min(col0 + 1, n_lon - 1)
         row0 = int(row_f); row1 = min(row0 + 1, n_lat - 1)
-
-        fc = col_f - col0
-        fr = row_f - row0
-
-        def ele(r, c):
-            idx = r * n_lon + c
-            v   = points[idx][2] if idx < len(points) else None
-            return v if v is not None else 0.0
-
-        z00 = ele(row0, col0); z10 = ele(row0, col1)
-        z01 = ele(row1, col0); z11 = ele(row1, col1)
-        z   = (z00 * (1-fc) * (1-fr) +
-               z10 *    fc  * (1-fr) +
-               z01 * (1-fc) *    fr  +
-               z11 *    fc  *    fr)
+        fc = col_f - col0; fr = row_f - row0
+        z = (ele_flat[row0 * n_lon + col0] * (1 - fc) * (1 - fr) +
+             ele_flat[row0 * n_lon + col1] *       fc  * (1 - fr) +
+             ele_flat[row1 * n_lon + col0] * (1 - fc) *       fr  +
+             ele_flat[row1 * n_lon + col1] *       fc  *       fr)
         return max(z, 0.0) * Z_SCALE
+
+    if HAVE_NUMPY:
+        import numpy as _np
+        _ele = _np.array(ele_flat).reshape(n_lat, n_lon)
+        _xr  = x_range or 1.0
+        _yr  = y_range or 1.0
+
+        def terrain_z_batch(xs, ys):
+            col_f = _np.clip((xs - x_min) / _xr * (n_lon - 1), 0.0, n_lon - 1)
+            row_f = _np.clip((ys - y_min) / _yr * (n_lat - 1), 0.0, n_lat - 1)
+            col0  = col_f.astype(_np.int32)
+            col1  = _np.minimum(col0 + 1, n_lon - 1)
+            row0  = row_f.astype(_np.int32)
+            row1  = _np.minimum(row0 + 1, n_lat - 1)
+            fc = col_f - col0; fr = row_f - row0
+            z = (_ele[row0, col0] * (1 - fc) * (1 - fr) +
+                 _ele[row0, col1] *       fc  * (1 - fr) +
+                 _ele[row1, col0] * (1 - fc) *       fr  +
+                 _ele[row1, col1] *       fc  *       fr)
+            return _np.maximum(z, 0.0) * Z_SCALE
+
+        terrain_z.batch = terrain_z_batch
 
     return terrain_z
 
@@ -1459,19 +2296,42 @@ def main():
         # Try blender_name first, then circuit_id as fallback in case the
         # object was created under a previous naming scheme.
         if CLEAR_EXISTING:
+            to_delete = set()
+
+            # 1. Parent-child tree (catches properly parented objects)
             existing = (bpy.data.objects.get(blender_name) or
                         bpy.data.objects.get(circuit_id))
             if existing is not None:
-                to_delete = []
                 def collect_children(o):
-                    to_delete.append(o)
+                    to_delete.add(o)
                     for child in o.children:
                         collect_children(child)
                 collect_children(existing)
-                # Use bpy.data.objects.remove rather than the operator so
-                # hidden objects are deleted regardless of viewport visibility.
+
+            # 2. All objects in any Monaco collection (catches orphaned objects
+            #    that are in the collection but not in the parent-child tree,
+            #    e.g. curves left over from a failed or earlier import run).
+            col_names = [
+                blender_name,
+                f"{blender_name} - Circuit",
+                f"{blender_name} - Terrain",
+                f"{blender_name} - Structures",
+                f"{blender_name} - Water Bodies",
+                f"{blender_name} - Roads",
+                f"{blender_name} - Vegetation",
+            ]
+            for col_name in col_names:
+                col = bpy.data.collections.get(col_name)
+                if col:
+                    for obj in list(col.objects):
+                        to_delete.add(obj)
+
+            if to_delete:
                 for o in to_delete:
-                    bpy.data.objects.remove(o, do_unlink=True)
+                    try:
+                        bpy.data.objects.remove(o, do_unlink=True)
+                    except Exception:
+                        pass
                 print(f"Cleared {len(to_delete)} existing objects.\n")
 
         # Create per-circuit collection hierarchy
@@ -1567,19 +2427,33 @@ def main():
                 terrain_tris = terrain_props.get("triangles", [])
                 if terrain_tris and terrain_z_fn is not None:
                     hex_name = f"{blender_name} - Terrain"
-                    print(f"  [{hex_name}]  building {len(terrain_tris)} tris ...",
+                    n_tris   = len(terrain_tris)
+                    print(f"  [{hex_name}]  building {n_tris} tris ...",
                           end=" ", flush=True)
                     import bmesh as _bm
-                    all_verts = []
-                    all_faces = []
-                    for tri in terrain_tris:
-                        base = len(all_verts)
-                        for pt in tri:
-                            px, py = equirectangular(pt[0], pt[1],
-                                                     lon_origin, lat_origin)
-                            pz     = terrain_z_fn(px, py)
-                            all_verts.append((px, py, pz))
-                        all_faces.append((base, base + 1, base + 2))
+
+                    cos_lat = _cos_lat_cache.get(lat_origin) or \
+                              math.cos(math.radians(lat_origin))
+
+                    if HAVE_NUMPY:
+                        import numpy as _np
+                        raw  = _np.array([[pt[0], pt[1]]
+                                          for tri in terrain_tris for pt in tri])
+                        xs   = (raw[:, 0] - lon_origin) * cos_lat * SCALE
+                        ys   = (raw[:, 1] - lat_origin) * SCALE
+                        batch = getattr(terrain_z_fn, 'batch', None)
+                        zs    = batch(xs, ys) if batch is not None else \
+                                _np.array([terrain_z_fn(x, y) for x, y in zip(xs, ys)])
+                        all_verts = list(zip(xs.tolist(), ys.tolist(), zs.tolist()))
+                    else:
+                        all_verts = []
+                        for tri in terrain_tris:
+                            for pt in tri:
+                                px = (pt[0] - lon_origin) * cos_lat * SCALE
+                                py = (pt[1] - lat_origin) * SCALE
+                                all_verts.append((px, py, terrain_z_fn(px, py)))
+
+                    all_faces = [(i * 3, i * 3 + 1, i * 3 + 2) for i in range(n_tris)]
 
                     print(f"{len(all_verts)} verts, creating mesh ...",
                           end=" ", flush=True)
@@ -1625,25 +2499,66 @@ def main():
             except Exception as e:
                 print(f"  [{blender_name} - Structures]  SKIP — {e}")
 
+        # ── Depth helper (Hakanson area scaling, per-tag cap) ─────────────
+        def _depth_for_ring(ring, water_tag):
+            if len(ring) < 3:
+                return 0.0
+            area_m2   = _polygon_area_m2(ring)
+            depth_cap = WATER_DEPTH_BY_TAG.get(water_tag, WATER_DEPTH_DEFAULT_M)
+            depth_m   = min(depth_cap, WATER_DEPTH_K * math.sqrt(area_m2))
+            print(f"    depth [{water_tag}] "
+                  f"area={area_m2/1e6:.3f} km²  "
+                  f"raw={WATER_DEPTH_K*math.sqrt(area_m2):.1f}m  "
+                  f"cap={depth_cap}m  -> {depth_m:.1f}m")
+            return depth_m
+
         # ── Sea polygons ───────────────────────────────────────────────
+        all_water_objs = []    # (mesh_obj, is_sea) tuples for projection step
+        depth_fns      = []
         for feat in features_by_type.get("sea", []):
             try:
-                build_sea_curve(feat, lon_origin, lat_origin,
-                                parent_empty, blender_name,
-                                collection=water_col)
+                ring    = ((feat.get("geometry") or {}).get("coordinates") or [[]])[0]
+                depth_m = _depth_for_ring(ring, "sea")
+                w_obj, depth_fn = build_sea_curve(feat, lon_origin, lat_origin,
+                                                   parent_empty, blender_name,
+                                                   depth_m=depth_m, ring=ring,
+                                                   collection=water_col)
+                if w_obj is not None:
+                    all_water_objs.append((w_obj, True))
+                if depth_fn is not None:
+                    depth_fns.append(depth_fn)
             except Exception as e:
-                print(f"  [{blender_name} - Sea]  SKIP — {e}")
+                print(f"  [{blender_name} - Sea]  SKIP - {e}")
 
-        # ── Water bodies (before terrain depression so Z is unmodified) ─
+        # ── Water bodies ───────────────────────────────────────────────
         water_tag_counts = {}
         for feat in features_by_type.get("water_body", []):
             try:
-                build_water_curve(feat, lon_origin, lat_origin,
-                                  parent_empty, blender_name,
-                                  water_tag_counts, terrain_z_fn,
-                                  collection=water_col)
+                water_tag = (feat.get("properties") or {}).get("water_tag", "water")
+                ring      = ((feat.get("geometry") or {}).get("coordinates") or [[]])[0]
+                depth_m   = _depth_for_ring(ring, water_tag)
+                w_obj, depth_fn = build_water_curve(feat, lon_origin, lat_origin,
+                                                      parent_empty, blender_name,
+                                                      water_tag_counts,
+                                                      depth_m=depth_m, ring=ring,
+                                                      collection=water_col)
+                if w_obj is not None:
+                    all_water_objs.append((w_obj, False))
+                if depth_fn is not None:
+                    depth_fns.append(depth_fn)
             except Exception as e:
-                print(f"  [{blender_name} - water]  SKIP — {e}")
+                print(f"  [{blender_name} - water]  SKIP - {e}")
+
+        # ── Step 3: Project water bodies onto terrain (flat surface) ───
+        # Sea → Z=0 (sea level). Inland bodies → mean terrain height.
+        for w_obj, is_sea in all_water_objs:
+            try:
+                project_water_mesh_flat(
+                    w_obj,
+                    terrain_z_fn if not is_sea else None,
+                    target_z=0.0 if is_sea else None)
+            except Exception as e:
+                print(f"  [{w_obj.name}]  projection SKIP - {e}")
 
         boundary_feats = features_by_type.get("terrain_boundary", [])
         if boundary_feats:
@@ -1775,8 +2690,25 @@ def main():
                 print(f"  [{blender_name} - Boundary Wall]  SKIP — {e}")
 
 
-        # Sea and water body depth are baked into terrain_points by master.py;
-        # no vertex group assignment or extrude_flat_groups call needed here.
+        # ── Apply water depth to terrain ───────────────────────────────────
+        if terrain_obj is not None:
+            try:
+                apply_water_depth_to_terrain(terrain_obj, depth_fns, blender_name)
+
+                # Pin wall bottom vertices to the terrain's new minimum Z.
+                z_min_final = min(v.co.z for v in terrain_obj.data.vertices)
+                wall_obj = (bpy.data.objects.get(f"{blender_name} - Terrain Boundary")
+                            or bpy.data.objects.get(f"{blender_name} - Boundary Wall"))
+                if wall_obj is not None:
+                    vg = wall_obj.vertex_groups.get("Bottom")
+                    if vg is not None:
+                        for v in wall_obj.data.vertices:
+                            if any(g.group == vg.index for g in v.groups):
+                                v.co.z = z_min_final
+                        wall_obj.data.update()
+                        print(f"  [{wall_obj.name}]  bottom pinned to z={z_min_final:.5f}")
+            except Exception as e:
+                print(f"  [{blender_name} - water depth]  SKIP - {e}")
 
         # Collect track spline points for Z fallback when terrain unavailable.
         track_pts = []

@@ -7,14 +7,15 @@ OSM street/road fetching for the F1 circuit pipeline.
 import math
 import requests
 
-from config import OVERPASS_URL, OVERPASS_DELAY, TERRAIN_RESOLUTION_M
+import json as _json
+from config import OVERPASS_URL, OVERPASS_DELAY, TERRAIN_RESOLUTION_M, RAW_DATA_DIR, USE_RAW_CACHE
 
 R_EARTH         = 6_371_000.0
 DEFAULT_WIDTH_M = 0.01
 LANE_WIDTH_M    = 3.5   # assumed width per lane when only lanes tag present
 
 
-def fetch_osm_streets(lat_min, lon_min, lat_max, lon_max):
+def fetch_osm_streets(circuit_id, lat_min, lon_min, lat_max, lon_max):
     """
     Query Overpass API for all highway ways within the bounding box.
 
@@ -24,6 +25,10 @@ def fetch_osm_streets(lat_min, lon_min, lat_max, lon_max):
       width_m     : resolved width in metres
       nodes       : list of [lon, lat] coordinate pairs
     """
+    _cp = RAW_DATA_DIR / "osm" / f"{circuit_id}_streets.json"
+    if USE_RAW_CACHE and _cp.exists():
+        with open(_cp) as _f: return _json.load(_f)
+
     bbox  = f"{lat_min},{lon_min},{lat_max},{lon_max}"
     query = f"""
 [out:json][timeout:90];
@@ -31,13 +36,25 @@ way["highway"]({bbox});
 out geom;
 """
     try:
-        resp = requests.post(
-            OVERPASS_URL, data={"data": query},
-            headers={"Content-Type": "application/x-www-form-urlencoded",
-                     "User-Agent": "F1CircuitsPipeline/1.0"},
-            timeout=95)
-        resp.raise_for_status()
-        data = resp.json()
+        for attempt in range(3):
+            resp = requests.post(
+                OVERPASS_URL, data={"data": query},
+                headers={"Content-Type": "application/x-www-form-urlencoded",
+                         "User-Agent": "F1CircuitsPipeline/1.0"},
+                timeout=95)
+            if resp.status_code == 429:
+                wait = 30 * (attempt + 1)
+                print(f"  [streets] rate limited, waiting {wait}s ...",
+                      end=" ", flush=True)
+                import time as _time
+                _time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        else:
+            print(f"  [streets] failed after 3 attempts (rate limited)")
+            return []
     except Exception as e:
         print(f"  [streets] OSM query failed: {e}")
         return []
@@ -109,4 +126,6 @@ out geom;
         pass
 
     print(f"  [streets] {len(streets)} ways fetched")
+    _cp.parent.mkdir(parents=True, exist_ok=True)
+    with open(_cp, "w") as _f: _json.dump(streets, _f)
     return streets
