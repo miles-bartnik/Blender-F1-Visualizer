@@ -1043,13 +1043,104 @@ def build_triangle_mesh(triangles, obj_name, z, lon_origin, lat_origin,
     return obj
 
 
+def _effective_ring_from_mesh(mesh_obj, lon_origin, lat_origin):
+    """
+    Extract the outer boundary of a water mesh as a list of [lon, lat] points,
+    working back from the surviving mesh geometry after island filtering.
+
+    Returns the rings sorted by length descending (largest first).  The depth
+    offset function should use rings[0] so that it covers exactly the same area
+    as the visible water mesh — no more, no less.  If extraction fails or the
+    mesh has no boundary (closed surface), returns [].
+
+    Algorithm: boundary edges are those shared by exactly one face.  We walk
+    those edges to form closed rings, then invert the Blender-XY → lon/lat
+    projection.
+    """
+    import bmesh as _bm
+    import math  as _math
+
+    if mesh_obj is None:
+        return []
+
+    me = mesh_obj.data
+    if not me.vertices:
+        return []
+
+    bm = _bm.new()
+    bm.from_mesh(me)
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+
+    boundary_edges = [e for e in bm.edges if len(e.link_faces) == 1]
+    if not boundary_edges:
+        bm.free()
+        return []
+
+    # Inverse projection: estimate cos_lat from mesh centroid
+    avg_lat_bl = sum(v.co.y for v in bm.verts) / len(bm.verts)
+    avg_lat    = avg_lat_bl / SCALE + lat_origin
+    cos_lat    = _math.cos(_math.radians(avg_lat))
+    if abs(cos_lat) < 1e-12:
+        bm.free()
+        return []
+
+    # Adjacency map: vert_index -> [neighbouring boundary vert indices]
+    adj = {}
+    for e in boundary_edges:
+        a = e.verts[0].index; b = e.verts[1].index
+        adj.setdefault(a, []).append(b)
+        adj.setdefault(b, []).append(a)
+
+    # Walk every connected ring
+    unvisited   = set(adj)
+    rings_lonlat = []
+
+    while unvisited:
+        start = next(iter(unvisited))
+        ring  = [start]
+        unvisited.discard(start)
+        prev  = None
+        curr  = start
+
+        for _ in range(len(boundary_edges) + 2):
+            nbs = [n for n in adj.get(curr, [])
+                   if n in unvisited or n == start]
+            if not nbs:
+                break
+            # avoid backtracking
+            nxt = next((n for n in nbs if n != prev), nbs[0])
+            if nxt == start:
+                break
+            ring.append(nxt)
+            unvisited.discard(nxt)
+            prev = curr
+            curr = nxt
+
+        if len(ring) >= 3:
+            ring_ll = []
+            for vi in ring:
+                v   = bm.verts[vi]
+                lon = v.co.x / (cos_lat * SCALE) + lon_origin
+                lat = v.co.y / SCALE          + lat_origin
+                ring_ll.append([lon, lat])
+            rings_lonlat.append(ring_ll)
+
+    bm.free()
+    rings_lonlat.sort(key=len, reverse=True)
+    return rings_lonlat
+
+
 def build_sea_curve(feat, lon_origin, lat_origin, parent_obj, blender_name,
                     depth_m=0.0, ring=None, collection=None):
     """
     Build sea H3 hex mesh at Z=0 (flat). Z is set to sea level (0) by
     project_water_mesh_flat after this returns. Depth displacement is
     handled separately by apply_water_depth_to_terrain.
-    Returns (mesh_obj, depth_offset_fn) — either may be None on failure.
+    Returns (mesh_obj, effective_ring) where effective_ring is derived from
+    the surviving mesh boundary after island filtering — use it instead of
+    the raw GeoJSON ring for depth-function containment so the two are
+    always consistent.
     """
     props     = feat.get("properties", {})
     sea_index = props.get("sea_index", 0)
@@ -1074,12 +1165,17 @@ def build_sea_curve(feat, lon_origin, lat_origin, parent_obj, blender_name,
         print(f"  [{mesh_name}]  mesh build failed or empty after island filter - skipped")
         return None, None
 
-    # Build depth fn from actual surviving mesh vertices so deleted
-    # islands cannot cause phantom terrain depressions.
     attach_nodegroup(mesh_obj, "Sea")
     print(f"  [{mesh_name}]  {len(triangles)} tris  "
           f"{len(mesh_obj.data.vertices)} verts (merged)  depth={depth_m:.1f}m")
-    return mesh_obj
+
+    # Derive the effective polygon ring from the surviving mesh boundary.
+    # This must be used for the depth function instead of the raw GeoJSON ring
+    # so that the two are always consistent: no displacement where there is
+    # no mesh.
+    eff_rings = _effective_ring_from_mesh(mesh_obj, lon_origin, lat_origin)
+    eff_ring  = eff_rings[0] if eff_rings else None
+    return mesh_obj, eff_ring
 
 
 def build_water_curve(feat, lon_origin, lat_origin, parent_obj, blender_name,
@@ -1089,14 +1185,16 @@ def build_water_curve(feat, lon_origin, lat_origin, parent_obj, blender_name,
     Build a water body hex mesh at Z=0 (flat). Z is projected to mean terrain
     height by project_water_mesh_flat after this returns. Depth displacement is
     computed from the projected mesh and applied by apply_water_depth_to_terrain.
-    Returns mesh_obj or None on failure.
+    Returns (mesh_obj, effective_ring) or (None, None) on failure.
+    effective_ring is derived from the surviving mesh boundary after island
+    filtering; use it in place of the raw GeoJSON ring for the depth function.
     """
     props     = feat.get("properties", {})
     water_tag = props.get("water_tag", "water")
 
     triangles = props.get("triangles", [])
     if not triangles or len(triangles) // 6 < MIN_WATER_HEX:
-        return None
+        return None, None
 
     tag_counts[water_tag] = tag_counts.get(water_tag, 0) + 1
     obj_name  = f"{blender_name} - Water - {water_tag} - {tag_counts[water_tag]}"
@@ -1113,12 +1211,15 @@ def build_water_curve(feat, lon_origin, lat_origin, parent_obj, blender_name,
 
     if mesh_obj is None:
         print(f"  [{mesh_name}]  mesh build failed or empty after island filter - skipped")
-        return None
+        return None, None
 
     attach_nodegroup(mesh_obj, "Water")
     print(f"  [{mesh_name}]  {len(triangles)} tris  "
           f"{len(mesh_obj.data.vertices)} verts (merged)  depth={depth_m:.1f}m")
-    return mesh_obj
+
+    eff_rings = _effective_ring_from_mesh(mesh_obj, lon_origin, lat_origin)
+    eff_ring  = eff_rings[0] if eff_rings else None
+    return mesh_obj, eff_ring
 
 
 def apply_water_depth_to_terrain(terrain_obj, depth_fns, blender_name,
@@ -2886,32 +2987,37 @@ def main():
 
         # ── Step 2: Build water body meshes (flat at Z=0) ─────────────
         # Each entry: (mesh_obj, is_sea, ring, water_tag)
-        # Depth is now computed inside _make_water_depth_offset_fn from
-        # the polygon's maximum inscribed radius (step 4a).
+        # 'ring' is the effective boundary derived from the surviving mesh
+        # geometry AFTER island filtering, not the raw GeoJSON ring.  This
+        # guarantees that depth displacement only covers areas where the water
+        # mesh actually exists — no phantom depressions where small islands
+        # were removed.  Falls back to the GeoJSON ring if extraction fails.
         all_water_data = []
         water_tag_counts = {}
 
         for feat in features_by_type.get("sea", []):
             try:
-                ring  = ((feat.get("geometry") or {}).get("coordinates") or [[]])[0]
-                w_obj = build_sea_curve(feat, lon_origin, lat_origin,
-                                        parent_empty, blender_name,
-                                        ring=ring, collection=water_col)
+                geo_ring      = ((feat.get("geometry") or {}).get("coordinates") or [[]])[0]
+                w_obj, eff_ring = build_sea_curve(feat, lon_origin, lat_origin,
+                                                   parent_empty, blender_name,
+                                                   ring=geo_ring, collection=water_col)
                 if w_obj is not None:
-                    all_water_data.append((w_obj, True, ring, "sea"))
+                    use_ring = eff_ring if (eff_ring and len(eff_ring) >= 3) else geo_ring
+                    all_water_data.append((w_obj, True, use_ring, "sea"))
             except Exception as e:
                 print(f"  [{blender_name} - Sea]  SKIP - {e}")
 
         for feat in features_by_type.get("water_body", []):
             try:
-                water_tag = (feat.get("properties") or {}).get("water_tag", "water")
-                ring      = ((feat.get("geometry") or {}).get("coordinates") or [[]])[0]
-                w_obj     = build_water_curve(feat, lon_origin, lat_origin,
-                                              parent_empty, blender_name,
-                                              water_tag_counts,
-                                              ring=ring, collection=water_col)
+                water_tag       = (feat.get("properties") or {}).get("water_tag", "water")
+                geo_ring        = ((feat.get("geometry") or {}).get("coordinates") or [[]])[0]
+                w_obj, eff_ring = build_water_curve(feat, lon_origin, lat_origin,
+                                                     parent_empty, blender_name,
+                                                     water_tag_counts,
+                                                     ring=geo_ring, collection=water_col)
                 if w_obj is not None:
-                    all_water_data.append((w_obj, False, ring, water_tag))
+                    use_ring = eff_ring if (eff_ring and len(eff_ring) >= 3) else geo_ring
+                    all_water_data.append((w_obj, False, use_ring, water_tag))
             except Exception as e:
                 print(f"  [{blender_name} - water]  SKIP - {e}")
 
