@@ -376,32 +376,12 @@ def _make_water_depth_offset_fn(mesh_obj, ring, depth_m, lon_origin, lat_origin,
             dist, i = _tree.query((px, py))
             if dist > radius_bu:
                 return 0.0
-            lon = px / (cos_lat * SCALE) + lon_origin
-            lat = py / SCALE + lat_origin
-            inside = False
-            n = len(_ring_x)
-            for k in range(n):
-                j = (k + 1) % n
-                xi, yi = _ring_x[k], _ring_y[k]
-                xj, yj = _ring_x[j], _ring_y[j]
-                if ((yi > lat) != (yj > lat) and
-                        lon < (xj - xi) * (lat - yi) / ((yj - yi) + 1e-12) + xi):
-                    inside = not inside
-            return float(_offsets[i]) if inside else 0.0
+            return float(_offsets[i])
 
         def depth_fn_batch(xs, ys):
             kd_dists, idxs = _tree.query(_np.column_stack([xs, ys]))
             result = _offsets[idxs].copy()
             result[kd_dists > radius_bu] = 0.0
-
-            # Containment check on every candidate terrain vertex
-            active = _np.where(result > 0.0)[0]
-            if active.size:
-                lons = xs[active] / (cos_lat * SCALE) + lon_origin
-                lats = ys[active] / SCALE + lat_origin
-                inside = _contains_batch(lons, lats)
-                result[active[~inside]] = 0.0
-
             return result
 
         depth_fn.batch = depth_fn_batch
@@ -2628,17 +2608,13 @@ def main():
         # ── Step 3: Project water bodies onto terrain ──────────────────
         # Use terrain_z_fn per vertex for ALL water bodies (sea and inland).
         # terrain_z_fn clamps to max(DEM, 0.0), so open-sea vertices land at
-        # Z=0 naturally.
-        #
-        # After projection, clamp_water_boundary_to_surface snaps any vertex
-        # that is geographically outside the water polygon back down to the
-        # water surface level. Boundary H3 hexagons straddle the polygon edge
-        # so their land-side vertices get positive terrain elevation — the clamp
-        # pass eliminates the resulting sawtooth fringe.
+        # Z=0 naturally. Boundary H3 hexagons that straddle the polygon edge
+        # will have land-side vertices at terrain elevation and water-side
+        # vertices at Z=0 — the depth formula handles the boundary smoothly
+        # via KD-tree proximity rather than a hard polygon containment cutoff.
         for w_obj, _is_sea, _ring, _depth in all_water_data:
             try:
                 project_water_mesh_to_terrain(w_obj, terrain_z_fn)
-                clamp_water_boundary_to_surface(w_obj, _ring, lon_origin, lat_origin)
             except Exception as e:
                 print(f"  [{w_obj.name}]  projection SKIP - {e}")
 
