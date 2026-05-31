@@ -276,85 +276,91 @@ def water_edge_falloff(t):
     return 0.5 * (1.0 - math.cos(math.pi * tt))
 
 
-def _make_water_depth_offset_fn(mesh_obj, ring, depth_m, lon_origin, lat_origin,
-                                bbox=None):
+def _make_water_depth_offset_fn(ring, depth_m, lon_origin, lat_origin, bbox=None):
     """
-    Build a depth-offset function from the actual, post-island-filtered mesh vertices.
+    Build a depth-offset function from the water polygon geometry.
 
-    Using mesh_obj (not the raw H3 triangle list) guarantees that:
-      - Stray mesh fragments that were deleted by island filtering are also
-        excluded from terrain displacement.
-      - Every source position is a vertex that exists in the visible mesh.
+    Depth at any interior terrain point is proportional to its distance from
+    the polygon boundary, normalised by the distance from the polygon centroid
+    to its nearest boundary vertex (the characteristic 'half-width').
 
-    bbox : optional (lon_min, lat_min, lon_max, lat_max). When provided, bbox
-        edges are excluded from the falloff boundary so that water bodies
-        clipped against the terrain boundary do not get a reduced depth near
-        the bbox edge. Only the natural shoreline drives the falloff.
+    The polygon ring vertices are used directly as the KD-tree source so depth
+    is rooted in the actual Shapely geometry rather than the H3 mesh:
+      - Boundary ring vertices naturally anchor depth = 0 at the shoreline.
+      - The cosine taper rises smoothly from 0 at the boundary to 1 at the
+        centroid, without any hard containment cliff artefacts.
 
-    The returned function takes Blender (x, y) and returns the depression
-    in Blender Z-units for that point.  It returns 0 for any point that
-    lies outside the water body polygon (containment is checked with a
-    numpy ray-cast so no bleed onto surrounding land).
+    bbox : optional (lon_min, lat_min, lon_max, lat_max). Ring vertices that
+        lie on a bbox edge are excluded from the KD-tree so that water bodies
+        clipped to the terrain boundary don't taper near the bbox edge — only
+        the natural shoreline drives the falloff.
     """
     if not HAVE_SHAPELY or not ring or len(ring) < 3 or depth_m <= 0:
         return None
-    if mesh_obj is None or len(mesh_obj.data.vertices) == 0:
-        return None
+
+    try:
+        import numpy as _np
+        from scipy.spatial import cKDTree as _KD
+    except ImportError:
+        return None   # scipy required
+
+    cos_lat = _cos_lat_cache.get(lat_origin) or math.cos(math.radians(lat_origin))
 
     try:
         poly = ShapelyPolygon([(p[0], p[1]) for p in ring])
         if not poly.is_valid:
             poly = poly.buffer(0)
-        full_boundary = poly.boundary
-
-        if bbox is not None:
-            from shapely.geometry import box as _box
-            bbox_boundary = _box(bbox[0], bbox[1], bbox[2], bbox[3]).boundary
-            natural_boundary = full_boundary.difference(bbox_boundary)
-            boundary = natural_boundary if not natural_boundary.is_empty else full_boundary
-        else:
-            boundary = full_boundary
+        if poly.is_empty:
+            return None
     except Exception:
         return None
 
-    cos_lat  = _cos_lat_cache.get(lat_origin) or math.cos(math.radians(lat_origin))
-
-    # Convert surviving mesh vertices → lon/lat, compute boundary distance
-    verts_bl  = [(v.co.x, v.co.y) for v in mesh_obj.data.vertices]
-    verts_geo = [
-        (x / (cos_lat * SCALE) + lon_origin,
-         y / SCALE + lat_origin)
-        for x, y in verts_bl
-    ]
-
-    dists    = [boundary.distance(Point(lon, lat)) for lon, lat in verts_geo]
-    max_dist = max(dists) if dists else 0.0
-
-    # Build (Blender XY) → depth_offset
-    xy_to_offset = {}
-    for (x, y), d in zip(verts_bl, dists):
-        t = min(d / max_dist, 1.0) if max_dist > 1e-12 else 1.0
-        xy_to_offset[(round(x, 5), round(y, 5))] = (
-            depth_m * water_edge_falloff(t) * Z_SCALE
-        )
-
-    if not xy_to_offset:
-        return None
-
-    # Pre-build ring as a flat numpy array for vectorised ray-casting
+    # ── Ring vertices for containment (full ring, lon/lat) ───────────────────
     _ring_x = [p[0] for p in ring]
     _ring_y = [p[1] for p in ring]
 
+    # ── Ring vertices for KD-tree (natural boundary only, Blender XY) ────────
+    # Exclude vertices sitting on the bbox edge so they don't pull depth to 0
+    # near the terrain boundary — only real shoreline vertices matter here.
+    if bbox is not None:
+        lon_min, lat_min, lon_max, lat_max = bbox
+        _tol = 1e-6
+        natural = [
+            (p[0], p[1]) for p in ring
+            if not (abs(p[0] - lon_min) < _tol or abs(p[0] - lon_max) < _tol or
+                    abs(p[1] - lat_min) < _tol or abs(p[1] - lat_max) < _tol)
+        ]
+        shore_pts = natural if len(natural) >= 2 else [(p[0], p[1]) for p in ring]
+    else:
+        shore_pts = [(p[0], p[1]) for p in ring]
+
+    # Convert shoreline ring vertices to Blender XY
+    shore_bl = _np.array([
+        ((lon - lon_origin) * cos_lat * SCALE,
+         (lat - lat_origin) * SCALE)
+        for lon, lat in shore_pts
+    ])
+
+    if len(shore_bl) == 0:
+        return None
+
+    # Build KD-tree on shoreline boundary vertices
+    _shore_tree = _KD(shore_bl)
+
+    # ── max_dist: distance from polygon centroid to its nearest boundary vertex ─
+    # Used to normalise depth so the deepest interior point = full depth_m.
+    cx_bl = (poly.centroid.x - lon_origin) * cos_lat * SCALE
+    cy_bl = (poly.centroid.y - lat_origin) * SCALE
+    max_dist_bl, _ = _shore_tree.query([cx_bl, cy_bl])
+    if max_dist_bl < 1e-12:
+        return None
+
+    # ── Vectorised ray-cast containment check ────────────────────────────────
     def _contains_batch(lons, lats):
-        """
-        Numpy ray-casting point-in-polygon for arrays of (lon, lat) points.
-        Returns a boolean array, True = inside.
-        """
-        import numpy as _np2
-        inside = _np2.zeros(len(lons), dtype=bool)
+        inside = _np.zeros(len(lons), dtype=bool)
         n = len(_ring_x)
         for i in range(n):
-            j   = (i + 1) % n
+            j = (i + 1) % n
             xi, yi = _ring_x[i], _ring_y[i]
             xj, yj = _ring_x[j], _ring_y[j]
             cond = ((yi > lats) != (yj > lats)) & (
@@ -363,33 +369,54 @@ def _make_water_depth_offset_fn(mesh_obj, ring, depth_m, lon_origin, lat_origin,
             inside ^= cond
         return inside
 
-    radius_bu = 90.0 / METRES_PER_DEGREE * SCALE
+    _blend = WATER_EDGE_BLEND
 
-    try:
-        import numpy as _np
-        from scipy.spatial import cKDTree as _KD
-        _pts     = _np.array(list(xy_to_offset.keys()))
-        _offsets = _np.array(list(xy_to_offset.values()))
-        _tree    = _KD(_pts)
+    # ── Scalar depth function ─────────────────────────────────────────────────
+    def depth_fn(px, py):
+        lon = px / (cos_lat * SCALE) + lon_origin
+        lat = py / SCALE + lat_origin
+        # Containment check (ray-casting)
+        inside = False
+        n = len(_ring_x)
+        for k in range(n):
+            j = (k + 1) % n
+            xi, yi = _ring_x[k], _ring_y[k]
+            xj, yj = _ring_x[j], _ring_y[j]
+            if ((yi > lat) != (yj > lat) and
+                    lon < (xj - xi) * (lat - yi) / ((yj - yi) + 1e-12) + xi):
+                inside = not inside
+        if not inside:
+            return 0.0
+        d, _ = _shore_tree.query((px, py))
+        t = min(d / max_dist_bl, 1.0)
+        return depth_m * water_edge_falloff(t) * Z_SCALE
 
-        def depth_fn(px, py):
-            dist, i = _tree.query((px, py))
-            if dist > radius_bu:
-                return 0.0
-            return float(_offsets[i])
+    # ── Batch (numpy) depth function ─────────────────────────────────────────
+    def depth_fn_batch(xs, ys):
+        # Distance from each terrain vertex to its nearest shoreline ring vertex
+        d_approx, _ = _shore_tree.query(_np.column_stack([xs, ys]))
+        t = _np.minimum(d_approx / max_dist_bl, 1.0)
 
-        def depth_fn_batch(xs, ys):
-            kd_dists, idxs = _tree.query(_np.column_stack([xs, ys]))
-            result = _offsets[idxs].copy()
-            result[kd_dists > radius_bu] = 0.0
-            return result
+        # Vectorised cosine taper (same shape as water_edge_falloff)
+        if _blend <= 0.0:
+            factors = _np.ones_like(t)
+        else:
+            factors = _np.where(
+                t >= _blend,
+                1.0,
+                0.5 * (1.0 - _np.cos(_np.pi * t / _blend))
+            )
 
-        depth_fn.batch = depth_fn_batch
+        result = depth_m * factors * Z_SCALE
 
-    except ImportError:
-        def depth_fn(px, py):
-            return 0.0   # scipy required for depth offset
+        # Zero out terrain vertices outside the polygon
+        lons = xs / (cos_lat * SCALE) + lon_origin
+        lats = ys / SCALE + lat_origin
+        result[~_contains_batch(lons, lats)] = 0.0
 
+        return result
+
+    depth_fn.batch = depth_fn_batch
     return depth_fn
 
 
@@ -427,75 +454,6 @@ def project_water_mesh_to_terrain(water_obj, terrain_z_fn, target_z=None):
 
     mesh.update()
 
-
-def clamp_water_boundary_to_surface(water_obj, ring, lon_origin, lat_origin):
-    """
-    Fix the sawtooth at water body coastline boundaries.
-
-    H3 hexagons at the polygon edge straddle the boundary — some vertices fall
-    inside the water polygon (Z from terrain_z_fn ≈ 0 for sea) and some fall
-    outside (Z from terrain_z_fn = positive land elevation).  That alternation
-    between adjacent vertices produces a sawtooth fringe.
-
-    This pass classifies every water mesh vertex as inside or outside the water
-    polygon (in geographic coordinates), then snaps every outside vertex's Z to
-    the water surface level — defined as the minimum Z among all inside vertices.
-
-    Must be called AFTER project_water_mesh_to_terrain so that inside vertices
-    already carry their correct surface Z before we derive water_z from them.
-    """
-    if not HAVE_SHAPELY or not ring or len(ring) < 3:
-        return
-    if water_obj is None:
-        return
-
-    mesh = water_obj.data
-    if not mesh.vertices:
-        return
-
-    try:
-        from shapely.prepared import prep as _sp
-        poly = ShapelyPolygon([(p[0], p[1]) for p in ring])
-        if not poly.is_valid:
-            poly = poly.buffer(0)
-        prep_poly = _sp(poly)
-    except Exception as exc:
-        print(f"  [{water_obj.name}] clamp_boundary: shapely error — {exc}")
-        return
-
-    cos_lat = _cos_lat_cache.get(lat_origin) or math.cos(math.radians(lat_origin))
-
-    inside_z   = []
-    outside_vi = []
-
-    for v in mesh.vertices:
-        lon = v.co.x / (cos_lat * SCALE) + lon_origin
-        lat = v.co.y / SCALE + lat_origin
-        if prep_poly.covers(Point(lon, lat)):
-            inside_z.append(v.co.z)
-        else:
-            outside_vi.append(v.index)
-
-    if not inside_z:
-        # No inside vertices found — polygon ring may not match the mesh.
-        # Skip silently to avoid zeroing the whole mesh.
-        return
-
-    # Water surface Z = minimum of all inside-polygon vertices.
-    # For sea this will be 0.0 (DEM clamped). For inland water it will be
-    # the terrain Z at the lake/river surface.
-    water_z = min(inside_z)
-
-    snapped = 0
-    for vi in outside_vi:
-        mesh.vertices[vi].co.z = water_z
-        snapped += 1
-
-    if snapped:
-        mesh.update()
-
-    print(f"  [{water_obj.name}]  boundary clamp: "
-          f"{snapped}/{len(outside_vi)} outside verts snapped to z={water_z:.5f}")
 
 
 # =============================================================================
@@ -2632,7 +2590,7 @@ def main():
         for w_obj, _is_sea, ring, depth_m in all_water_data:
             try:
                 depth_fn = _make_water_depth_offset_fn(
-                    w_obj, ring, depth_m, lon_origin, lat_origin,
+                    ring, depth_m, lon_origin, lat_origin,
                     bbox=_bbox)
                 if depth_fn is not None:
                     depth_fns.append(depth_fn)
