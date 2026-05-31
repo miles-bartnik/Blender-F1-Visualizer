@@ -324,6 +324,25 @@ def _make_water_depth_offset_fn(ring, water_tag, lon_origin, lat_origin, bbox=No
     _ring_x = [p[0] for p in ring]
     _ring_y = [p[1] for p in ring]
 
+    # ── Expanded containment polygon (smooth coastline boundary) ─────────────
+    # Expand by half an H3 res-9 cell (~111 m = 0.001 deg) so that terrain
+    # vertices just outside the jagged H3 hex boundary are treated as inside.
+    # Their shore distance is tiny, so depth_fn still returns ≈ 0 there —
+    # the depth gradient is now continuous across the coastline edge.
+    _CONT_BUFFER = 0.001   # degrees, ~111 m
+    try:
+        _poly_cont = poly.buffer(_CONT_BUFFER)
+        if hasattr(_poly_cont, 'exterior') and not _poly_cont.is_empty:
+            _cc = list(_poly_cont.exterior.coords)
+            _cont_ring_x = [c[0] for c in _cc]
+            _cont_ring_y = [c[1] for c in _cc]
+        else:
+            _cont_ring_x = _ring_x
+            _cont_ring_y = _ring_y
+    except Exception:
+        _cont_ring_x = _ring_x
+        _cont_ring_y = _ring_y
+
     # ── Shoreline KD-tree (natural boundary only, Blender XY) ────────────────
     # Exclude vertices on the bbox edge so depth doesn't taper to 0 there.
     if bbox is not None:
@@ -400,14 +419,14 @@ def _make_water_depth_offset_fn(ring, water_tag, lon_origin, lat_origin, bbox=No
     if depth_m <= 0:
         return None
 
-    # ── Vectorised ray-cast containment check ────────────────────────────────
+    # ── Vectorised ray-cast containment check (uses expanded polygon) ────────
     def _contains_batch(lons, lats):
         inside = _np.zeros(len(lons), dtype=bool)
-        n = len(_ring_x)
+        n = len(_cont_ring_x)
         for i in range(n):
             j = (i + 1) % n
-            xi, yi = _ring_x[i], _ring_y[i]
-            xj, yj = _ring_x[j], _ring_y[j]
+            xi, yi = _cont_ring_x[i], _cont_ring_y[i]
+            xj, yj = _cont_ring_x[j], _cont_ring_y[j]
             cond = ((yi > lats) != (yj > lats)) & (
                 lons < (xj - xi) * (lats - yi) / ((yj - yi) + 1e-12) + xi
             )
@@ -416,16 +435,16 @@ def _make_water_depth_offset_fn(ring, water_tag, lon_origin, lat_origin, bbox=No
 
     _blend = WATER_EDGE_BLEND
 
-    # ── Scalar depth function ─────────────────────────────────────────────────
+    # ── Scalar depth function (uses expanded containment polygon) ────────────
     def depth_fn(px, py):
         lon = px / (cos_lat * SCALE) + lon_origin
         lat = py / SCALE + lat_origin
         inside = False
-        n = len(_ring_x)
+        n = len(_cont_ring_x)
         for k in range(n):
             j = (k + 1) % n
-            xi, yi = _ring_x[k], _ring_y[k]
-            xj, yj = _ring_x[j], _ring_y[j]
+            xi, yi = _cont_ring_x[k], _cont_ring_y[k]
+            xj, yj = _cont_ring_x[j], _cont_ring_y[j]
             if ((yi > lat) != (yj > lat) and
                     lon < (xj - xi) * (lat - yi) / ((yj - yi) + 1e-12) + xi):
                 inside = not inside
