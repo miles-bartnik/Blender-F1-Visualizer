@@ -448,6 +448,76 @@ def project_water_mesh_to_terrain(water_obj, terrain_z_fn, target_z=None):
     mesh.update()
 
 
+def clamp_water_boundary_to_surface(water_obj, ring, lon_origin, lat_origin):
+    """
+    Fix the sawtooth at water body coastline boundaries.
+
+    H3 hexagons at the polygon edge straddle the boundary — some vertices fall
+    inside the water polygon (Z from terrain_z_fn ≈ 0 for sea) and some fall
+    outside (Z from terrain_z_fn = positive land elevation).  That alternation
+    between adjacent vertices produces a sawtooth fringe.
+
+    This pass classifies every water mesh vertex as inside or outside the water
+    polygon (in geographic coordinates), then snaps every outside vertex's Z to
+    the water surface level — defined as the minimum Z among all inside vertices.
+
+    Must be called AFTER project_water_mesh_to_terrain so that inside vertices
+    already carry their correct surface Z before we derive water_z from them.
+    """
+    if not HAVE_SHAPELY or not ring or len(ring) < 3:
+        return
+    if water_obj is None:
+        return
+
+    mesh = water_obj.data
+    if not mesh.vertices:
+        return
+
+    try:
+        from shapely.prepared import prep as _sp
+        poly = ShapelyPolygon([(p[0], p[1]) for p in ring])
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+        prep_poly = _sp(poly)
+    except Exception as exc:
+        print(f"  [{water_obj.name}] clamp_boundary: shapely error — {exc}")
+        return
+
+    cos_lat = _cos_lat_cache.get(lat_origin) or math.cos(math.radians(lat_origin))
+
+    inside_z   = []
+    outside_vi = []
+
+    for v in mesh.vertices:
+        lon = v.co.x / (cos_lat * SCALE) + lon_origin
+        lat = v.co.y / SCALE + lat_origin
+        if prep_poly.covers(Point(lon, lat)):
+            inside_z.append(v.co.z)
+        else:
+            outside_vi.append(v.index)
+
+    if not inside_z:
+        # No inside vertices found — polygon ring may not match the mesh.
+        # Skip silently to avoid zeroing the whole mesh.
+        return
+
+    # Water surface Z = minimum of all inside-polygon vertices.
+    # For sea this will be 0.0 (DEM clamped). For inland water it will be
+    # the terrain Z at the lake/river surface.
+    water_z = min(inside_z)
+
+    snapped = 0
+    for vi in outside_vi:
+        mesh.vertices[vi].co.z = water_z
+        snapped += 1
+
+    if snapped:
+        mesh.update()
+
+    print(f"  [{water_obj.name}]  boundary clamp: "
+          f"{snapped}/{len(outside_vi)} outside verts snapped to z={water_z:.5f}")
+
+
 # =============================================================================
 # GEOJSON HELPERS
 # =============================================================================
@@ -2558,12 +2628,17 @@ def main():
         # ── Step 3: Project water bodies onto terrain ──────────────────
         # Use terrain_z_fn per vertex for ALL water bodies (sea and inland).
         # terrain_z_fn clamps to max(DEM, 0.0), so open-sea vertices land at
-        # Z=0 naturally. Boundary hexagons that straddle the coastline get the
-        # correct terrain elevation on their land-side vertices rather than
-        # defaulting to 0, which would create a sawtooth at the water edge.
+        # Z=0 naturally.
+        #
+        # After projection, clamp_water_boundary_to_surface snaps any vertex
+        # that is geographically outside the water polygon back down to the
+        # water surface level. Boundary H3 hexagons straddle the polygon edge
+        # so their land-side vertices get positive terrain elevation — the clamp
+        # pass eliminates the resulting sawtooth fringe.
         for w_obj, _is_sea, _ring, _depth in all_water_data:
             try:
                 project_water_mesh_to_terrain(w_obj, terrain_z_fn)
+                clamp_water_boundary_to_surface(w_obj, _ring, lon_origin, lat_origin)
             except Exception as e:
                 print(f"  [{w_obj.name}]  projection SKIP - {e}")
 
