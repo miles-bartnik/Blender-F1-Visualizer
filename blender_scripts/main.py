@@ -477,7 +477,17 @@ def _make_water_depth_offset_fn(ring, water_tag, lon_origin, lat_origin, bbox=No
 
         return result
 
-    depth_fn.batch = depth_fn_batch
+    # ── Containment helper (Blender XY → bool mask) ──────────────────────────
+    # Used externally to clamp sea-level terrain without depending on depth value,
+    # since ring vertices at distance=0 → falloff=0 → depth_fn returns 0 even
+    # though they are inside the polygon.
+    def contains_batch(xs, ys):
+        lons = xs / (cos_lat * SCALE) + lon_origin
+        lats = ys / SCALE + lat_origin
+        return _contains_batch(lons, lats)
+
+    depth_fn.batch    = depth_fn_batch
+    depth_fn.contains = contains_batch
     return depth_fn
 
 
@@ -1095,13 +1105,21 @@ def build_water_curve(feat, lon_origin, lat_origin, parent_obj, blender_name,
     return mesh_obj
 
 
-def apply_water_depth_to_terrain(terrain_obj, depth_fns, blender_name):
+def apply_water_depth_to_terrain(terrain_obj, depth_fns, blender_name,
+                                  sea_depth_fns=None):
     """
     Depress terrain vertices by the combined depth offset from all water bodies.
 
-    depth_fns : list of callables returned by _make_water_depth_offset_fn.
-                Each returns a depression amount in Blender Z-units for a given
-                (x, y) position. Supports a .batch(xs, ys) numpy path.
+    depth_fns     : list of callables returned by _make_water_depth_offset_fn.
+                    Each returns a depression amount in Blender Z-units for a
+                    given (x, y) position. Supports a .batch(xs, ys) numpy path.
+    sea_depth_fns : optional subset of depth_fns that correspond to sea polygons.
+                    After depression, any terrain vertex inside a sea polygon is
+                    clamped to Z ≤ 0 (sea level). This handles coastlines where
+                    the COP30 DEM shows harbour walls / quays at > 0 m — the
+                    coastline ring vertices receive 0 depression (falloff = 0 at
+                    shore distance = 0), so without the clamp they stay above
+                    sea level and poke through the sea mesh.
 
     For each terrain vertex the maximum offset across all water bodies is used
     (lakes and sea can overlap; the deeper one wins). Vertices with zero offset
@@ -1130,6 +1148,24 @@ def apply_water_depth_to_terrain(terrain_obj, depth_fns, blender_name):
             if total[i] > 0.0:
                 v.co.z -= total[i]
                 moved  += 1
+
+        # ── Sea-level clamp ───────────────────────────────────────────────────
+        # Terrain vertices inside a sea polygon must be at or below Z=0.
+        # The depth function returns 0 at the shore ring (falloff = 0 there),
+        # so DEM > 0 coastal vertices receive no depression above — clamp them.
+        if sea_depth_fns:
+            sea_inside = _np.zeros(n, dtype=bool)
+            for fn in sea_depth_fns:
+                ct = getattr(fn, 'contains', None)
+                if ct is not None:
+                    sea_inside |= ct(xs, ys)
+            clamped = 0
+            for i, v in enumerate(mesh.vertices):
+                if sea_inside[i] and v.co.z > 0.0:
+                    v.co.z = 0.0
+                    clamped += 1
+            if clamped:
+                print(f"  [{blender_name}] sea-level clamp: {clamped} coastal verts → 0")
     else:
         moved = 0
         for v in mesh.vertices:
@@ -1137,6 +1173,14 @@ def apply_water_depth_to_terrain(terrain_obj, depth_fns, blender_name):
             if offset > 0.0:
                 v.co.z -= offset
                 moved  += 1
+        # Sea-level clamp (scalar fallback)
+        if sea_depth_fns:
+            for v in mesh.vertices:
+                if v.co.z > 0.0:
+                    if any(getattr(fn, 'contains', lambda x, y: _np.array([False]))(
+                               _np.array([v.co.x]), _np.array([v.co.y]))[0]
+                           for fn in sea_depth_fns):
+                        v.co.z = 0.0
 
     mesh.update()
     print(f"  [{blender_name}] water depth: {moved} terrain verts depressed")
@@ -2608,15 +2652,16 @@ def main():
                 print(f"  [{blender_name} - water]  SKIP - {e}")
 
         # ── Step 3: Project water bodies onto terrain ──────────────────
-        # Use terrain_z_fn per vertex for ALL water bodies (sea and inland).
-        # terrain_z_fn clamps to max(DEM, 0.0), so open-sea vertices land at
-        # Z=0 naturally. Boundary H3 hexagons that straddle the polygon edge
-        # will have land-side vertices at terrain elevation and water-side
-        # vertices at Z=0 — the depth formula handles the boundary smoothly
-        # via KD-tree proximity rather than a hard polygon containment cutoff.
-        for w_obj, _is_sea, _ring, _depth in all_water_data:
+        # Sea mesh → flat at Z=0 (sea level). Monaco and other coastal circuits
+        # have DEM > 0 at harbour walls / quays; projecting to terrain would
+        # raise the sea surface above sea level at those points.
+        # Inland water bodies → follow terrain (lakes sit at their elevation).
+        for w_obj, is_sea, _ring, _depth in all_water_data:
             try:
-                project_water_mesh_to_terrain(w_obj, terrain_z_fn)
+                if is_sea:
+                    project_water_mesh_to_terrain(w_obj, terrain_z_fn, target_z=0.0)
+                else:
+                    project_water_mesh_to_terrain(w_obj, terrain_z_fn)
             except Exception as e:
                 print(f"  [{w_obj.name}]  projection SKIP - {e}")
 
@@ -2630,14 +2675,17 @@ def main():
         ) if all(_tp.get(k) is not None for k in
                  ("lon_min", "lat_min", "lon_max", "lat_max")) else None
 
-        depth_fns = []
-        for w_obj, _is_sea, ring, water_tag in all_water_data:
+        depth_fns     = []
+        sea_depth_fns = []   # sea-only subset for the sea-level clamp pass
+        for w_obj, is_sea, ring, water_tag in all_water_data:
             try:
                 depth_fn = _make_water_depth_offset_fn(
                     ring, water_tag, lon_origin, lat_origin,
                     bbox=_bbox)
                 if depth_fn is not None:
                     depth_fns.append(depth_fn)
+                    if is_sea:
+                        sea_depth_fns.append(depth_fn)
             except Exception as e:
                 print(f"  [{w_obj.name}]  depth_fn SKIP - {e}")
 
@@ -2774,7 +2822,8 @@ def main():
         # ── Apply water depth to terrain ───────────────────────────────────
         if terrain_obj is not None:
             try:
-                apply_water_depth_to_terrain(terrain_obj, depth_fns, blender_name)
+                apply_water_depth_to_terrain(terrain_obj, depth_fns, blender_name,
+                                             sea_depth_fns=sea_depth_fns or None)
 
                 # Pin wall bottom vertices to the terrain's new minimum Z.
                 z_min_final = min(v.co.z for v in terrain_obj.data.vertices)
