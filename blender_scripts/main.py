@@ -156,10 +156,12 @@ VEG_DENSITIES = {
 }
 VEG_DENSITY_DEFAULT = (0.0, 0.0, 1.0)  # fallback for unmapped tags
 
-# Water / sea depth model — Håkanson power law: depth_m = k * sqrt(area_m²)
-# Area scaling is applied for all types; the per-tag cap prevents physically
-# implausible depths for small or narrow features.
-WATER_DEPTH_K = 0.3   # empirical Håkanson coefficient
+# Water depth model — proportional to max inscribed radius (pole of inaccessibility).
+# depth_m = min(tag_cap, WATER_DEPTH_PROPORTIONAL_K * max_dist_m)
+# where max_dist_m is the maximum distance from any interior point to the shoreline.
+# This is geometrically equivalent to Håkanson for circular bodies, but correctly
+# gives shallower depths for elongated or irregular polygons.
+WATER_DEPTH_PROPORTIONAL_K = 0.1   # 10 % of inscribed radius → max depth
 
 # Maximum depression depth (metres) per OSM water_tag.
 # Lookup order matches primary_tag() in water.py: water > natural > landuse > waterway.
@@ -168,24 +170,24 @@ WATER_DEPTH_BY_TAG = {
     "sea":          50.0,
     "ocean":        50.0,
     # ── Lakes and generic open water ──────────────────────────────────────────
-    "lake":         30.0,
-    "water":        20.0,   # natural=water without a sub-type
-    "pond":          4.0,
-    "oxbow":         3.0,
-    "lagoon":       15.0,
-    "moat":          3.0,
+    "lake":          8.0,
+    "water":         5.0,   # natural=water without a sub-type
+    "pond":          1.5,
+    "oxbow":         2.0,
+    "lagoon":        6.0,
+    "moat":          1.5,
     # ── Managed / artificial ──────────────────────────────────────────────────
-    "reservoir":    20.0,
-    "basin":         3.0,   # retention / drainage basin — intentionally shallow
+    "reservoir":     8.0,
+    "basin":         2.0,   # retention / drainage basin — intentionally shallow
     # ── Wetland ───────────────────────────────────────────────────────────────
-    "wetland":       1.5,
+    "wetland":       1.0,
     # ── Rivers and waterways ──────────────────────────────────────────────────
-    "river":         6.0,
-    "riverbank":     5.0,
-    "canal":         3.0,
-    "dock":         12.0,
+    "river":         4.0,
+    "riverbank":     3.0,
+    "canal":         2.0,
+    "dock":          8.0,
 }
-WATER_DEPTH_DEFAULT_M = 8.0   # fallback for unmapped tags
+WATER_DEPTH_DEFAULT_M = 5.0   # fallback for unmapped tags
 
 # Fraction of the water body's half-width that is the cosine edge-blend zone.
 # 0.0 = sharp cliff (no taper).  1.0 = full S-curve taper (old behaviour).
@@ -276,26 +278,29 @@ def water_edge_falloff(t):
     return 0.5 * (1.0 - math.cos(math.pi * tt))
 
 
-def _make_water_depth_offset_fn(ring, depth_m, lon_origin, lat_origin, bbox=None):
+def _make_water_depth_offset_fn(ring, water_tag, lon_origin, lat_origin, bbox=None):
     """
     Build a depth-offset function from the water polygon geometry.
 
-    Depth at any interior terrain point is proportional to its distance from
-    the polygon boundary, normalised by the distance from the polygon centroid
-    to its nearest boundary vertex (the characteristic 'half-width').
+    Maximum depth is computed from the polygon's maximum inscribed radius
+    (pole of inaccessibility approximated by sampling the interior):
 
-    The polygon ring vertices are used directly as the KD-tree source so depth
-    is rooted in the actual Shapely geometry rather than the H3 mesh:
-      - Boundary ring vertices naturally anchor depth = 0 at the shoreline.
-      - The cosine taper rises smoothly from 0 at the boundary to 1 at the
-        centroid, without any hard containment cliff artefacts.
+        depth_m = min(tag_cap, WATER_DEPTH_PROPORTIONAL_K * max_dist_m)
 
-    bbox : optional (lon_min, lat_min, lon_max, lat_max). Ring vertices that
-        lie on a bbox edge are excluded from the KD-tree so that water bodies
-        clipped to the terrain boundary don't taper near the bbox edge — only
-        the natural shoreline drives the falloff.
+    where max_dist_m is the furthest distance from any sampled interior point
+    to the natural shoreline.  This replaces the Hakanson area-based formula
+    and correctly gives shallower depths for elongated or irregular polygons.
+
+    Depth at each terrain vertex scales linearly with its distance from the
+    natural shoreline, normalised by max_dist (cosine taper applied within
+    the outer WATER_EDGE_BLEND fraction of the width).
+
+    bbox : optional (lon_min, lat_min, lon_max, lat_max). Ring vertices on a
+        bbox edge are excluded from the KD-tree so that water bodies clipped
+        to the terrain boundary do not taper near the bbox edge — only the
+        natural shoreline drives the falloff.
     """
-    if not HAVE_SHAPELY or not ring or len(ring) < 3 or depth_m <= 0:
+    if not HAVE_SHAPELY or not ring or len(ring) < 3:
         return None
 
     try:
@@ -319,9 +324,8 @@ def _make_water_depth_offset_fn(ring, depth_m, lon_origin, lat_origin, bbox=None
     _ring_x = [p[0] for p in ring]
     _ring_y = [p[1] for p in ring]
 
-    # ── Ring vertices for KD-tree (natural boundary only, Blender XY) ────────
-    # Exclude vertices sitting on the bbox edge so they don't pull depth to 0
-    # near the terrain boundary — only real shoreline vertices matter here.
+    # ── Shoreline KD-tree (natural boundary only, Blender XY) ────────────────
+    # Exclude vertices on the bbox edge so depth doesn't taper to 0 there.
     if bbox is not None:
         lon_min, lat_min, lon_max, lat_max = bbox
         _tol = 1e-6
@@ -334,25 +338,66 @@ def _make_water_depth_offset_fn(ring, depth_m, lon_origin, lat_origin, bbox=None
     else:
         shore_pts = [(p[0], p[1]) for p in ring]
 
-    # Convert shoreline ring vertices to Blender XY
     shore_bl = _np.array([
         ((lon - lon_origin) * cos_lat * SCALE,
          (lat - lat_origin) * SCALE)
         for lon, lat in shore_pts
     ])
-
     if len(shore_bl) == 0:
         return None
 
-    # Build KD-tree on shoreline boundary vertices
     _shore_tree = _KD(shore_bl)
 
-    # ── max_dist: distance from polygon centroid to its nearest boundary vertex ─
-    # Used to normalise depth so the deepest interior point = full depth_m.
-    cx_bl = (poly.centroid.x - lon_origin) * cos_lat * SCALE
-    cy_bl = (poly.centroid.y - lat_origin) * SCALE
-    max_dist_bl, _ = _shore_tree.query([cx_bl, cy_bl])
+    # ── max_dist: maximum inscribed radius (Blender units) ───────────────────
+    # Approximate the pole of inaccessibility by sampling a 15×15 grid of
+    # points inside the polygon bounding box, keeping only those inside the
+    # polygon, and taking the furthest distance to the natural shoreline.
+    # This gives a far better estimate than centroid-to-boundary for concave
+    # or elongated polygons like bays and river channels.
+    minx, miny, maxx, maxy = poly.bounds
+    _gx = _np.linspace(minx, maxx, 15)
+    _gy = _np.linspace(miny, maxy, 15)
+    _gxx, _gyy = _np.meshgrid(_gx, _gy)
+    _grid_lonlat = _np.column_stack([_gxx.ravel(), _gyy.ravel()])
+
+    # Ray-cast containment for the grid
+    _inside_mask = _np.zeros(len(_grid_lonlat), dtype=bool)
+    _n = len(_ring_x)
+    for _i in range(_n):
+        _j = (_i + 1) % _n
+        _xi, _yi = _ring_x[_i], _ring_y[_i]
+        _xj, _yj = _ring_x[_j], _ring_y[_j]
+        _cond = ((_yi > _grid_lonlat[:, 1]) != (_yj > _grid_lonlat[:, 1])) & (
+            _grid_lonlat[:, 0] < (_xj - _xi) * (_grid_lonlat[:, 1] - _yi)
+            / ((_yj - _yi) + 1e-12) + _xi
+        )
+        _inside_mask ^= _cond
+
+    _interior = _grid_lonlat[_inside_mask]
+    if len(_interior) == 0:
+        # Fallback to centroid
+        _interior = _np.array([[poly.centroid.x, poly.centroid.y]])
+
+    _interior_bl = _np.column_stack([
+        (_interior[:, 0] - lon_origin) * cos_lat * SCALE,
+        (_interior[:, 1] - lat_origin) * SCALE,
+    ])
+    _d_grid, _ = _shore_tree.query(_interior_bl)
+    max_dist_bl = float(_d_grid.max())
+
     if max_dist_bl < 1e-12:
+        return None
+
+    # Convert max_dist to metres and compute depth_m
+    max_dist_m   = max_dist_bl * METRES_PER_DEGREE / SCALE
+    depth_cap    = WATER_DEPTH_BY_TAG.get(water_tag, WATER_DEPTH_DEFAULT_M)
+    depth_m      = min(depth_cap, WATER_DEPTH_PROPORTIONAL_K * max_dist_m)
+    print(f"    depth [{water_tag}]  "
+          f"max_dist={max_dist_m:.0f} m  "
+          f"raw={WATER_DEPTH_PROPORTIONAL_K * max_dist_m:.1f} m  "
+          f"cap={depth_cap} m  -> {depth_m:.1f} m")
+
+    if depth_m <= 0:
         return None
 
     # ── Vectorised ray-cast containment check ────────────────────────────────
@@ -375,7 +420,6 @@ def _make_water_depth_offset_fn(ring, depth_m, lon_origin, lat_origin, bbox=None
     def depth_fn(px, py):
         lon = px / (cos_lat * SCALE) + lon_origin
         lat = py / SCALE + lat_origin
-        # Containment check (ray-casting)
         inside = False
         n = len(_ring_x)
         for k in range(n):
@@ -393,11 +437,9 @@ def _make_water_depth_offset_fn(ring, depth_m, lon_origin, lat_origin, bbox=None
 
     # ── Batch (numpy) depth function ─────────────────────────────────────────
     def depth_fn_batch(xs, ys):
-        # Distance from each terrain vertex to its nearest shoreline ring vertex
         d_approx, _ = _shore_tree.query(_np.column_stack([xs, ys]))
         t = _np.minimum(d_approx / max_dist_bl, 1.0)
 
-        # Vectorised cosine taper (same shape as water_edge_falloff)
         if _blend <= 0.0:
             factors = _np.ones_like(t)
         else:
@@ -409,7 +451,6 @@ def _make_water_depth_offset_fn(ring, depth_m, lon_origin, lat_origin, bbox=None
 
         result = depth_m * factors * Z_SCALE
 
-        # Zero out terrain vertices outside the polygon
         lons = xs / (cos_lat * SCALE) + lon_origin
         lats = ys / SCALE + lat_origin
         result[~_contains_batch(lons, lats)] = 0.0
@@ -2515,36 +2556,21 @@ def main():
             except Exception as e:
                 print(f"  [{blender_name} - Structures]  SKIP — {e}")
 
-        # ── Depth helper (Hakanson area scaling, per-tag cap) ─────────────
-        def _depth_for_ring(ring, water_tag):
-            if len(ring) < 3:
-                return 0.0
-            area_m2   = _polygon_area_m2(ring)
-            depth_cap = WATER_DEPTH_BY_TAG.get(water_tag, WATER_DEPTH_DEFAULT_M)
-            depth_m   = min(depth_cap, WATER_DEPTH_K * math.sqrt(area_m2))
-            print(f"    depth [{water_tag}] "
-                  f"area={area_m2/1e6:.3f} km²  "
-                  f"raw={WATER_DEPTH_K*math.sqrt(area_m2):.1f}m  "
-                  f"cap={depth_cap}m  -> {depth_m:.1f}m")
-            return depth_m
-
         # ── Step 2: Build water body meshes (flat at Z=0) ─────────────
-        # Each entry: (mesh_obj, is_sea, ring, depth_m)
-        # ring and depth_m are preserved so depth_fn can be computed
-        # from the projected mesh in step 4, not from the flat mesh here.
+        # Each entry: (mesh_obj, is_sea, ring, water_tag)
+        # Depth is now computed inside _make_water_depth_offset_fn from
+        # the polygon's maximum inscribed radius (step 4a).
         all_water_data = []
         water_tag_counts = {}
 
         for feat in features_by_type.get("sea", []):
             try:
-                ring    = ((feat.get("geometry") or {}).get("coordinates") or [[]])[0]
-                depth_m = _depth_for_ring(ring, "sea")
-                w_obj   = build_sea_curve(feat, lon_origin, lat_origin,
-                                          parent_empty, blender_name,
-                                          depth_m=depth_m, ring=ring,
-                                          collection=water_col)
+                ring  = ((feat.get("geometry") or {}).get("coordinates") or [[]])[0]
+                w_obj = build_sea_curve(feat, lon_origin, lat_origin,
+                                        parent_empty, blender_name,
+                                        ring=ring, collection=water_col)
                 if w_obj is not None:
-                    all_water_data.append((w_obj, True, ring, depth_m))
+                    all_water_data.append((w_obj, True, ring, "sea"))
             except Exception as e:
                 print(f"  [{blender_name} - Sea]  SKIP - {e}")
 
@@ -2552,14 +2578,12 @@ def main():
             try:
                 water_tag = (feat.get("properties") or {}).get("water_tag", "water")
                 ring      = ((feat.get("geometry") or {}).get("coordinates") or [[]])[0]
-                depth_m   = _depth_for_ring(ring, water_tag)
                 w_obj     = build_water_curve(feat, lon_origin, lat_origin,
                                               parent_empty, blender_name,
                                               water_tag_counts,
-                                              depth_m=depth_m, ring=ring,
-                                              collection=water_col)
+                                              ring=ring, collection=water_col)
                 if w_obj is not None:
-                    all_water_data.append((w_obj, False, ring, depth_m))
+                    all_water_data.append((w_obj, False, ring, water_tag))
             except Exception as e:
                 print(f"  [{blender_name} - water]  SKIP - {e}")
 
@@ -2587,10 +2611,10 @@ def main():
                  ("lon_min", "lat_min", "lon_max", "lat_max")) else None
 
         depth_fns = []
-        for w_obj, _is_sea, ring, depth_m in all_water_data:
+        for w_obj, _is_sea, ring, water_tag in all_water_data:
             try:
                 depth_fn = _make_water_depth_offset_fn(
-                    ring, depth_m, lon_origin, lat_origin,
+                    ring, water_tag, lon_origin, lat_origin,
                     bbox=_bbox)
                 if depth_fn is not None:
                     depth_fns.append(depth_fn)
