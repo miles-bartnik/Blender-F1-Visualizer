@@ -102,6 +102,7 @@ def fetch_osm_water(circuit_id, lat_min, lon_min, lat_max, lon_max, elevations, 
     tags = [
         '["natural"="water"]',   '["natural"="wetland"]',
         '["landuse"="reservoir"]', '["landuse"="basin"]',
+        '["landuse"="harbour"]',
         '["waterway"="riverbank"]', '["waterway"="dock"]',
         '["waterway"="canal"]',
     ]

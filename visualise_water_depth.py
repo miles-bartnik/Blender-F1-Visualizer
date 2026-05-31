@@ -25,6 +25,7 @@ WATER_DEPTH_BY_TAG = {
     "lagoon": 6.0, "moat": 1.5, "reservoir": 8.0, "basin": 2.0,
     "wetland": 1.0, "river": 4.0, "riverbank": 3.0,
     "canal": 2.0, "dock": 8.0,
+    "harbour": 10.0,
 }
 WATER_DEPTH_DEFAULT_M = 5.0
 

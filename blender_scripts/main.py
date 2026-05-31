@@ -186,6 +186,7 @@ WATER_DEPTH_BY_TAG = {
     "riverbank":     3.0,
     "canal":         2.0,
     "dock":          8.0,
+    "harbour":      10.0,   # landuse=harbour — open harbour basins (e.g. Port Hercule)
 }
 WATER_DEPTH_DEFAULT_M = 5.0   # fallback for unmapped tags
 
