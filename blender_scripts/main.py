@@ -190,6 +190,14 @@ WATER_DEPTH_BY_TAG = {
 }
 WATER_DEPTH_DEFAULT_M = 5.0   # fallback for unmapped tags
 
+# Sea-level clamp: terrain vertices inside the sea polygon that are above sea
+# level get forced to Z=0 (to correct DEM artefacts from harbour walls / quays
+# whose tops are captured above sea level by COP30).  Vertices above this
+# threshold are assumed to be genuine cliff faces — they are NOT clamped so
+# the cliff relief is preserved.  Harbour walls are typically 2–4 m; 8 m gives
+# comfortable headroom while staying well below real cliff heights (>10 m).
+SEA_LEVEL_CLAMP_MAX_M = 8.0
+
 # Fraction of the water body's half-width that is the cosine edge-blend zone.
 # 0.0 = sharp cliff (no taper).  1.0 = full S-curve taper (old behaviour).
 # 0.25 → outer 25% tapers, inner 75% is at full depth (realistic bowl/shelf).
@@ -1153,7 +1161,13 @@ def apply_water_depth_to_terrain(terrain_obj, depth_fns, blender_name,
         # Terrain vertices inside a sea polygon must be at or below Z=0.
         # The depth function returns 0 at the shore ring (falloff = 0 there),
         # so DEM > 0 coastal vertices receive no depression above — clamp them.
+        # Height threshold: only clamp vertices within SEA_LEVEL_CLAMP_MAX_M of
+        # sea level.  The containment polygon is expanded by ~111 m (sawtooth
+        # fix), which pulls in cliff faces just outside the shoreline.  Without
+        # the threshold those cliff faces would be zeroed out; with it, anything
+        # above 8 m is assumed to be genuine cliff relief and is left untouched.
         if sea_depth_fns:
+            _clamp_max = SEA_LEVEL_CLAMP_MAX_M * Z_SCALE
             sea_inside = _np.zeros(n, dtype=bool)
             for fn in sea_depth_fns:
                 ct = getattr(fn, 'contains', None)
@@ -1161,7 +1175,7 @@ def apply_water_depth_to_terrain(terrain_obj, depth_fns, blender_name,
                     sea_inside |= ct(xs, ys)
             clamped = 0
             for i, v in enumerate(mesh.vertices):
-                if sea_inside[i] and v.co.z > 0.0:
+                if sea_inside[i] and 0.0 < v.co.z <= _clamp_max:
                     v.co.z = 0.0
                     clamped += 1
             if clamped:
@@ -1175,8 +1189,9 @@ def apply_water_depth_to_terrain(terrain_obj, depth_fns, blender_name,
                 moved  += 1
         # Sea-level clamp (scalar fallback)
         if sea_depth_fns:
+            _clamp_max = SEA_LEVEL_CLAMP_MAX_M * Z_SCALE
             for v in mesh.vertices:
-                if v.co.z > 0.0:
+                if 0.0 < v.co.z <= _clamp_max:
                     if any(getattr(fn, 'contains', lambda x, y: _np.array([False]))(
                                _np.array([v.co.x]), _np.array([v.co.y]))[0]
                            for fn in sea_depth_fns):
