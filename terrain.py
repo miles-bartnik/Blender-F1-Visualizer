@@ -198,14 +198,21 @@ def _make_bilinear_z(terrain_data):
 
 def _cells_to_triangles(cells, bilinear_z_vec, bilinear_z_scalar, h3,
                          clamp_lon_min=None, clamp_lon_max=None,
-                         clamp_lat_min=None, clamp_lat_max=None):
+                         clamp_lat_min=None, clamp_lat_max=None,
+                         include_cell_id=False):
     """
     Convert a set of H3 cells to triangles with bilinear Z interpolation.
 
     If clamp_* bounds are provided, cell centroids are clamped to those
     bounds before sampling Z (used for boundary ring cells outside the terrain).
 
-    Returns list of [[lon,lat,z],[lon,lat,z],[lon,lat,z]].
+    If include_cell_id is True each triangle vertex gains a 4th element: the
+    sequential 0-based index of its H3 cell within this call.  All three
+    vertices of a triangle carry the same index (they all belong to the same
+    cell).  Used downstream to group vertices by cell for cliff detection.
+
+    Returns list of [[lon,lat,z],[lon,lat,z],[lon,lat,z]]
+            or      [[lon,lat,z,cell_idx], ...] when include_cell_id=True.
     """
     if not cells:
         return []
@@ -242,11 +249,16 @@ def _cells_to_triangles(cells, bilinear_z_vec, bilinear_z_scalar, h3,
         clat, clon = centres[i]
         cz         = float(z_vals[idx]); idx += 1
         centre     = [round(clon, 8), round(clat, 8), round(cz, 4)]
+        if include_cell_id:
+            centre = centre + [i]
 
         bverts = []
         for blat, blon in boundaries[i]:
             bz = float(z_vals[idx]); idx += 1
-            bverts.append([round(blon, 8), round(blat, 8), round(bz, 4)])
+            bv = [round(blon, 8), round(blat, 8), round(bz, 4)]
+            if include_cell_id:
+                bv = bv + [i]
+            bverts.append(bv)
 
         n = len(bverts)
         for j in range(n):
@@ -525,7 +537,8 @@ def build_terrain_hexagons(terrain_data, resolution):
         print(f"  [h3 terrain] polyfill failed: {e}")
         return []
 
-    triangles = _cells_to_triangles(cells, bilinear_z_vec, None, h3)
+    triangles = _cells_to_triangles(cells, bilinear_z_vec, None, h3,
+                                     include_cell_id=True)
     print(f"  [h3 terrain] {len(cells)} cells → {len(triangles)} triangles "
           f"at resolution {resolution}")
     return triangles

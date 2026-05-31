@@ -198,6 +198,14 @@ WATER_DEPTH_DEFAULT_M = 5.0   # fallback for unmapped tags
 # comfortable headroom while staying well below real cliff heights (>10 m).
 SEA_LEVEL_CLAMP_MAX_M = 8.0
 
+# Cliff face generation: H3 res-12 average edge length is ~41 m.  Two adjacent
+# cells whose median elevations differ by more than CLIFF_THRESHOLD_M get a
+# vertical wall face inserted between them.  15 m ≈ 37 % of the cell edge,
+# corresponding to a slope steeper than ~20°—well beyond normal terrain but
+# reliably catches coastal and inland cliffs.  Adjust up to reduce wall count
+# on rough hilly terrain, or down to sharpen subtler escarpments.
+CLIFF_THRESHOLD_M = 15.0
+
 # Fraction of the water body's half-width that is the cosine edge-blend zone.
 # 0.0 = sharp cliff (no taper).  1.0 = full S-curve taper (old behaviour).
 # 0.25 → outer 25% tapers, inner 75% is at full depth (realistic bowl/shelf).
@@ -1199,6 +1207,200 @@ def apply_water_depth_to_terrain(terrain_obj, depth_fns, blender_name,
 
     mesh.update()
     print(f"  [{blender_name}] water depth: {moved} terrain verts depressed")
+
+
+def generate_cliff_faces(terrain_obj, threshold_m):
+    """
+    Post-process the terrain mesh to add vertical cliff-face quads wherever
+    adjacent H3 cells have a median-elevation difference > threshold_m.
+
+    Requires the mesh to have a 'hex_cell' INT face layer (written during mesh
+    construction when build_terrain_hexagons supplies cell indices).  If that
+    layer is absent the function is a no-op.
+
+    Algorithm
+    ---------
+    1.  Build cell → vertex membership from the face layer.
+    2.  Compute per-cell median Z.
+    3.  Outlier correction: if a cell has exactly one vertex that deviates by
+        more than threshold/2 from its cell median, snap it to the median.
+        This eliminates single-pixel DEM spikes inside otherwise flat cells.
+    4.  Re-compute cell medians after correction.
+    5.  Find inter-cell edges whose cell medians differ by > threshold_m.
+    6.  For each cliff edge:
+          a.  Snap the shared edge vertices to z_high (taking the maximum
+              z_high across all cliff edges sharing that vertex, so vertices
+              at the junction of several cliff-top cells are consistent).
+          b.  Create low-elevation copies of the edge vertices at z_low
+              (keyed by (orig_index, c_low) so a vertex shared between
+              multiple cliff-top → same-c_low edges gets one copy).
+          c.  Reassign the low-cell face(s) touching this edge to use the
+              low copies.
+          d.  Add a quad wall face  v0_hi → v1_hi → v1_lo → v0_lo.
+    7.  Recompute normals and rebuild hex_cell_0/1/2 vertex attributes.
+    """
+    if terrain_obj is None:
+        return
+
+    import bmesh as _bm
+
+    # Median helper — avoid importing statistics (not available in all Blender
+    # Python builds).
+    def _median(xs):
+        s = sorted(xs)
+        n = len(s)
+        return (s[n // 2] + s[(n - 1) // 2]) / 2.0 if n else 0.0
+
+    me = terrain_obj.data
+    bm = _bm.new()
+    bm.from_mesh(me)
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+
+    cell_fl = bm.faces.layers.int.get("hex_cell")
+    if cell_fl is None:
+        bm.free()
+        print(f"  [{terrain_obj.name}] cliff: no hex_cell layer — skipped")
+        return
+
+    threshold_bl = threshold_m * Z_SCALE
+
+    # ── 1. Cell → vertex index sets ──────────────────────────────────────────
+    cell_vidx = {}
+    for face in bm.faces:
+        cid = face[cell_fl]
+        if cid < 0:
+            continue
+        s = cell_vidx.setdefault(cid, set())
+        for v in face.verts:
+            s.add(v.index)
+
+    def _recompute_medians():
+        bm.verts.ensure_lookup_table()
+        return {cid: _median([bm.verts[vi].co.z for vi in vis])
+                for cid, vis in cell_vidx.items()}
+
+    cell_med = _recompute_medians()
+
+    # ── 2. Outlier correction ─────────────────────────────────────────────────
+    half_t   = threshold_bl * 0.5
+    n_snap   = 0
+    for cid, vis in cell_vidx.items():
+        z_med    = cell_med[cid]
+        outliers = [vi for vi in vis
+                    if abs(bm.verts[vi].co.z - z_med) > half_t]
+        # Only correct when clearly a minority (single bad DEM pixel)
+        if 0 < len(outliers) < len(vis) // 2:
+            for vi in outliers:
+                bm.verts[vi].co.z = z_med
+                n_snap += 1
+
+    cell_med = _recompute_medians()
+
+    # ── 3. Collect cliff edges ────────────────────────────────────────────────
+    cliff_list = []   # (edge, c_high, c_low, z_high, z_low)
+    for edge in bm.edges:
+        lf = edge.link_faces
+        if len(lf) != 2:
+            continue
+        cid0 = lf[0][cell_fl]; cid1 = lf[1][cell_fl]
+        if cid0 == cid1 or cid0 < 0 or cid1 < 0:
+            continue
+        z0 = cell_med.get(cid0, 0.0); z1 = cell_med.get(cid1, 0.0)
+        if abs(z0 - z1) <= threshold_bl:
+            continue
+        if z0 > z1:
+            cliff_list.append((edge, cid0, cid1, z0, z1))
+        else:
+            cliff_list.append((edge, cid1, cid0, z1, z0))
+
+    if not cliff_list:
+        bm.free()
+        print(f"  [{terrain_obj.name}] cliff: 0 edges above {threshold_m:.0f} m")
+        return
+
+    # ── 4. Pre-compute maximum z_high per cliff-edge vertex ──────────────────
+    # When a vertex sits on several cliff edges (e.g. at the junction of three
+    # cells), snap it to the highest of the high-cell medians so every high-
+    # side face is consistent.
+    snap_z = {}   # vert_index -> z_high (maximum across all cliff edges)
+    for edge, _ch, _cl, z_high, _zl in cliff_list:
+        for v in edge.verts:
+            snap_z[v.index] = max(snap_z.get(v.index, z_high), z_high)
+
+    # ── 5. Apply cliff geometry ───────────────────────────────────────────────
+    split_map = {}   # (orig_vert_index, c_low) -> new low BMVert
+    n_walls   = 0
+
+    for edge, c_high, c_low, z_high, z_low in cliff_list:
+        v0, v1 = edge.verts[0], edge.verts[1]
+
+        # Snap shared vertices to the high-side canonical elevation
+        v0.co.z = snap_z.get(v0.index, z_high)
+        v1.co.z = snap_z.get(v1.index, z_high)
+
+        # Get or create low copies (one copy per (orig_vertex, c_low) pair)
+        def _low_v(v, cl, zl):
+            key = (v.index, cl)
+            if key not in split_map:
+                vn = bm.verts.new((v.co.x, v.co.y, zl))
+                split_map[key] = vn
+            return split_map[key]
+
+        v0l = _low_v(v0, c_low, z_low)
+        v1l = _low_v(v1, c_low, z_low)
+
+        # Reassign low-cell faces: snapshot the list first so face removal
+        # doesn't invalidate the iterator
+        low_faces = [f for f in list(edge.link_faces) if f[cell_fl] == c_low]
+        for face in low_faces:
+            old_verts = list(face.verts)
+            cid_save  = face[cell_fl]
+            bm.faces.remove(face)
+            new_verts = [v0l if (v is v0) else (v1l if (v is v1) else v)
+                         for v in old_verts]
+            try:
+                nf = bm.faces.new(new_verts)
+                nf[cell_fl] = cid_save
+            except Exception:
+                pass   # degenerate / duplicate — skip
+
+        # Wall quad: high edge at top, low copies at bottom
+        try:
+            wf = bm.faces.new([v0, v1, v1l, v0l])
+            wf[cell_fl] = -1   # cliff wall belongs to no cell
+            n_walls += 1
+        except Exception:
+            pass
+
+    # ── 6. Finalise ──────────────────────────────────────────────────────────
+    bm.normal_update()
+    bm.verts.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+
+    # Rebuild hex_cell_0/1/2 attributes from the updated topology
+    nv  = len(bm.verts)
+    vc0 = [-1] * nv; vc1 = [-1] * nv; vc2 = [-1] * nv
+    for v in bm.verts:
+        cs = sorted(set(f[cell_fl] for f in v.link_faces if f[cell_fl] >= 0))
+        if len(cs) > 0: vc0[v.index] = cs[0]
+        if len(cs) > 1: vc1[v.index] = cs[1]
+        if len(cs) > 2: vc2[v.index] = cs[2]
+
+    bm.to_mesh(me)
+    bm.free()
+    me.update()
+
+    for an, av in [("hex_cell_0", vc0), ("hex_cell_1", vc1), ("hex_cell_2", vc2)]:
+        if an in me.attributes:
+            me.attributes.remove(me.attributes[an])
+        attr = me.attributes.new(an, 'INT', 'POINT')
+        for i, val in enumerate(av):
+            attr.data[i].value = val
+
+    print(f"  [{terrain_obj.name}] cliff: {n_walls} wall faces  "
+          f"{n_snap} outlier verts corrected  threshold={threshold_m:.0f} m")
 
 
 def build_bounding_wall(terrain_props, lon_origin, lat_origin,
@@ -2571,6 +2773,14 @@ def main():
                     cos_lat = _cos_lat_cache.get(lat_origin) or \
                               math.cos(math.radians(lat_origin))
 
+                    # Detect whether triangles carry a cell index (4th element).
+                    # build_terrain_hexagons stores it; water/boundary meshes don't.
+                    _has_cid = len(terrain_tris[0][0]) > 3
+                    # One cell ID per triangle (all 3 vertices of a triangle
+                    # belong to the same H3 cell).
+                    _tri_cids = [int(tri[0][3]) for tri in terrain_tris] \
+                                if _has_cid else None
+
                     if HAVE_NUMPY:
                         import numpy as _np
                         raw  = _np.array([[pt[0], pt[1]]
@@ -2600,11 +2810,50 @@ def main():
 
                     bm = _bm.new()
                     bm.from_mesh(me)
+
+                    # Attach cell IDs to faces BEFORE remove_doubles so the
+                    # layer is preserved on the merged vertices.
+                    if _tri_cids is not None:
+                        _cfl = bm.faces.layers.int.new("hex_cell")
+                        bm.faces.ensure_lookup_table()
+                        for _fi, _face in enumerate(bm.faces):
+                            _face[_cfl] = _tri_cids[_fi]
+
                     _bm.ops.remove_doubles(bm, verts=bm.verts,
                                            dist=0.01 * Z_SCALE)
+
+                    # After merging, record which cells each vertex belongs to
+                    # (up to 3 — H3 boundary vertices are shared by 3 cells).
+                    if _tri_cids is not None:
+                        _cfl = bm.faces.layers.int.get("hex_cell")
+                        bm.verts.ensure_lookup_table()
+                        bm.faces.ensure_lookup_table()
+                        _nv = len(bm.verts)
+                        _vc0 = [-1] * _nv
+                        _vc1 = [-1] * _nv
+                        _vc2 = [-1] * _nv
+                        for _v in bm.verts:
+                            _cs = sorted(set(
+                                _f[_cfl] for _f in _v.link_faces
+                                if _f[_cfl] >= 0))
+                            if len(_cs) > 0: _vc0[_v.index] = _cs[0]
+                            if len(_cs) > 1: _vc1[_v.index] = _cs[1]
+                            if len(_cs) > 2: _vc2[_v.index] = _cs[2]
+
                     bm.to_mesh(me)
                     bm.free()
                     me.update()
+
+                    # Write vertex cell-membership attributes
+                    if _tri_cids is not None:
+                        for _an, _av in [("hex_cell_0", _vc0),
+                                         ("hex_cell_1", _vc1),
+                                         ("hex_cell_2", _vc2)]:
+                            if _an in me.attributes:
+                                me.attributes.remove(me.attributes[_an])
+                            _attr = me.attributes.new(_an, 'INT', 'POINT')
+                            for _i, _vv in enumerate(_av):
+                                _attr.data[_i].value = _vv
 
                     hex_obj = bpy.data.objects.new(hex_name, me)
                     hex_obj["circuit_id"]   = circuit_id
@@ -2839,6 +3088,15 @@ def main():
             try:
                 apply_water_depth_to_terrain(terrain_obj, depth_fns, blender_name,
                                              sea_depth_fns=sea_depth_fns or None)
+
+                # ── Cliff face generation ───────────────────────────────────
+                # Run after water depth so sea-floor and coastal elevations are
+                # final before cliff detection.  Operates entirely on mesh
+                # topology and the hex_cell face layer — no GeoJSON re-read.
+                try:
+                    generate_cliff_faces(terrain_obj, CLIFF_THRESHOLD_M)
+                except Exception as _ce:
+                    print(f"  [{blender_name}] cliff generation SKIP - {_ce}")
 
                 # Pin wall bottom vertices to the terrain's new minimum Z.
                 z_min_final = min(v.co.z for v in terrain_obj.data.vertices)
